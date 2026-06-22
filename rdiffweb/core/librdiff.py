@@ -1111,30 +1111,42 @@ class RdiffRepo(object):
         assert restore_as_of, "restore_as_of must be defined"
         assert kind in ['tar', 'tar.bz2', 'tar.gz', 'tbz2', 'tgz', 'zip', 'raw', None]
 
-        # Phase 1: Validate path using fstat (this also checks access permissions)
-        # This is the SAME security check for BOTH raw and archive downloads
-        path_obj = self.fstat(path)
+        restore_state = RestoreState(
+            success_callback=success_callback,
+            failure_callback=failure_callback,
+        )
 
-        # Define proper kind according to path type.
-        if path_obj.isdir:
+        try:
+            # Phase 1: Validate path using fstat (this also checks access permissions)
+            # This is the SAME security check for BOTH raw and archive downloads
+            path_obj = self.fstat(path)
+
+            # Define proper kind according to path type.
+            if path_obj.isdir:
+                if kind == 'raw':
+                    raise ValueError('raw type not supported for directory')
+                kind = kind or 'zip'
+            else:
+                kind = kind or 'raw'
+
+            # Define proper filename according to the path
             if kind == 'raw':
-                raise ValueError('raw type not supported for directory')
-            kind = kind or 'zip'
-        else:
-            kind = kind or 'raw'
+                filename = path_obj.display_name
+            else:
+                filename = "%s.%s" % (path_obj.display_name, kind)
 
-        # Define proper filename according to the path
-        if kind == 'raw':
-            filename = path_obj.display_name
-        else:
-            filename = "%s.%s" % (path_obj.display_name, kind)
+            # Build the full path to restore.
+            # path_obj.path may be quoted (e.g., ";090" for non-ASCII chars).
+            # rdiff-backup command line expects the logical (unquoted) path,
+            # as it handles quoted filenames on disk internally.
+            # unquote() is idempotent for already-unquoted paths.
+            full_path = os.path.join(self.full_path, unquote(path_obj.path))
+        except Exception as e:
+            restore_state.abort(str(e))
+            raise
 
-        # Build the full path to restore.
-        # path_obj.path may be quoted (e.g., ";090" for non-ASCII chars).
-        # rdiff-backup command line expects the logical (unquoted) path,
-        # as it handles quoted filenames on disk internally.
-        # unquote() is idempotent for already-unquoted paths.
-        full_path = os.path.join(self.full_path, unquote(path_obj.path))
+        # Phase 1 complete
+        restore_state.mark_path_validated()
 
         # Search full path location of rdiff-backup.
         rdiff_backup = find_rdiff_backup()
@@ -1147,13 +1159,6 @@ class RdiffRepo(object):
         }
         if os.environ.get('TMPDIR'):
             env['TMPDIR'] = os.environ['TMPDIR']
-
-        # Create RestoreState and mark phase 1 complete
-        restore_state = RestoreState(
-            success_callback=success_callback,
-            failure_callback=failure_callback,
-        )
-        restore_state.mark_path_validated()
 
         # Execute the restore process and pipe the result.
         fileobj = pipe_restore(

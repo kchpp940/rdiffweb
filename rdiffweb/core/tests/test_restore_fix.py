@@ -310,7 +310,6 @@ class TestWrapCloseIntegration(unittest.TestCase):
 
         wrapper._set_stream_established()
 
-        # Simulate browser disconnect mid-transfer
         wrapper.abort('browser disconnected')
 
         self.assertEqual(state.state, STATE_FAILED)
@@ -318,6 +317,33 @@ class TestWrapCloseIntegration(unittest.TestCase):
         self.assertEqual(self.success_count, 0)
         self.assertEqual(self.failure_count, 1)
         self.assertEqual(self.failure_args[0], (None, 'browser disconnected'))
+
+    @patch('os.waitpid')
+    @patch('os.kill')
+    def test_abort_does_not_call_close(self, mock_kill, mock_waitpid):
+        """Test that abort() only updates state, does NOT call close()."""
+        wrapper, stream, state = self._create_wrapper()
+
+        wrapper._set_stream_established()
+        wrapper.abort('browser disconnected')
+
+        self.assertTrue(state.is_failed)
+        self.assertFalse(wrapper._closed, 'abort() should NOT call close() - caller is responsible')
+
+    @patch('os.waitpid')
+    @patch('os.kill')
+    def test_abort_then_close(self, mock_kill, mock_waitpid):
+        """Test that abort() + close() together properly reap the process."""
+        wrapper, stream, state = self._create_wrapper()
+        mock_waitpid.return_value = (12345, 0 << 8)
+
+        wrapper._set_stream_established()
+        wrapper.abort('browser disconnected')
+        wrapper.close()
+
+        self.assertTrue(wrapper._closed)
+        self.assertEqual(state.state, STATE_FAILED)
+        self.assertEqual(self.failure_count, 1)
 
     @patch('os.waitpid')
     @patch('os.kill')
@@ -596,13 +622,7 @@ class TestFileGeneratorWithRestoreState(unittest.TestCase):
                 self.state.mark_transfer_complete()
 
             def abort(self, reason=None):
-                if not self._closed:
-                    self._closed = True
-                    self.state.abort(reason)
-                    try:
-                        self._stream.close()
-                    except Exception:
-                        pass
+                self.state.abort(reason)
 
             def close(self):
                 if not self._closed:
@@ -651,7 +671,7 @@ class TestFileGeneratorWithRestoreState(unittest.TestCase):
         self.assertIn('connection reset', state.abort_reason)
 
     def test_close_before_end_calls_abort(self):
-        """Test that closing generator mid-transfer calls abort()."""
+        """Test that closing generator mid-transfer calls abort() then close()."""
         data = b'chunk1chunk2chunk3'
         wrapper, state = self._create_mock_wrapper(data)
 
@@ -665,6 +685,19 @@ class TestFileGeneratorWithRestoreState(unittest.TestCase):
         self.assertTrue(wrapper._closed)
         self.assertEqual(state.state, STATE_FAILED)
         self.assertIn('aborted by client', state.abort_reason)
+
+    def test_close_after_transfer_completes_normally(self):
+        """Test that close() after transfer complete just calls input.close()."""
+        data = b'chunk1chunk2chunk3'
+        wrapper, state = self._create_mock_wrapper(data)
+
+        gen = self._file_generator(wrapper, chunkSize=6)
+        chunks = list(gen)
+
+        self.assertEqual(b''.join(chunks), data)
+        self.assertTrue(wrapper._transfer_complete)
+        self.assertTrue(wrapper._closed)
+        self.assertEqual(state.state, STATE_TRANSFER_COMPLETE)
 
     def test_del_fallback_calls_abort(self):
         """Test that __del__ on incomplete transfer calls abort()."""
@@ -951,6 +984,136 @@ class TestSecurityPathValidation(unittest.TestCase):
                     from rdiffweb.core.restore import RestoreState
                     self.assertIsInstance(state, RestoreState)
                     self.assertEqual(state.state, STATE_PATH_VALIDATED)
+
+
+class TestPathValidationFailure(unittest.TestCase):
+    """Test that path validation failures trigger failure_callback."""
+
+    def test_fstat_access_denied_triggers_failure_callback(self):
+        from rdiffweb.core.librdiff import RdiffRepo, AccessDeniedError
+
+        failure_args = []
+
+        def failure_cb(exit_code, abort_reason=None):
+            failure_args.append((exit_code, abort_reason))
+
+        with patch.object(RdiffRepo, 'fstat', side_effect=AccessDeniedError('access denied')):
+            repo = RdiffRepo('/tmp/testrepo', 'utf-8')
+
+            with self.assertRaises(AccessDeniedError):
+                repo.restore(
+                    b'../etc/passwd', 1234567890, kind='raw',
+                    failure_callback=failure_cb,
+                )
+
+        self.assertEqual(len(failure_args), 1)
+        self.assertIn('access denied', str(failure_args[0][1]))
+
+    def test_fstat_does_not_exist_triggers_failure_callback(self):
+        from rdiffweb.core.librdiff import RdiffRepo, DoesNotExistError
+
+        failure_args = []
+
+        def failure_cb(exit_code, abort_reason=None):
+            failure_args.append((exit_code, abort_reason))
+
+        with patch.object(RdiffRepo, 'fstat', side_effect=DoesNotExistError(b'notfound')):
+            repo = RdiffRepo('/tmp/testrepo', 'utf-8')
+
+            with self.assertRaises(DoesNotExistError):
+                repo.restore(
+                    b'notfound', 1234567890, kind='raw',
+                    failure_callback=failure_cb,
+                )
+
+        self.assertEqual(len(failure_args), 1)
+        self.assertIn('notfound', str(failure_args[0][1]))
+
+    def test_raw_on_directory_triggers_failure_callback(self):
+        from rdiffweb.core.librdiff import RdiffRepo
+
+        failure_args = []
+
+        def failure_cb(exit_code, abort_reason=None):
+            failure_args.append((exit_code, abort_reason))
+
+        with patch.object(RdiffRepo, 'fstat') as mock_fstat:
+            mock_path_obj = MagicMock()
+            mock_path_obj.isdir = True
+            mock_fstat.return_value = mock_path_obj
+
+            repo = RdiffRepo('/tmp/testrepo', 'utf-8')
+
+            with self.assertRaises(ValueError):
+                repo.restore(
+                    b'testdir', 1234567890, kind='raw',
+                    failure_callback=failure_cb,
+                )
+
+        self.assertEqual(len(failure_args), 1)
+        self.assertIn('raw type not supported', str(failure_args[0][1]))
+
+    def test_fstat_failure_does_not_trigger_success_callback(self):
+        from rdiffweb.core.librdiff import RdiffRepo, AccessDeniedError
+
+        success_called = [False]
+
+        def success_cb():
+            success_called[0] = True
+
+        failure_args = []
+
+        def failure_cb(exit_code, abort_reason=None):
+            failure_args.append((exit_code, abort_reason))
+
+        with patch.object(RdiffRepo, 'fstat', side_effect=AccessDeniedError('denied')):
+            repo = RdiffRepo('/tmp/testrepo', 'utf-8')
+
+            with self.assertRaises(AccessDeniedError):
+                repo.restore(
+                    b'../etc/passwd', 1234567890, kind='raw',
+                    success_callback=success_cb,
+                    failure_callback=failure_cb,
+                )
+
+        self.assertFalse(success_called[0], 'success_callback must NOT fire on fstat failure')
+        self.assertEqual(len(failure_args), 1)
+
+
+class TestArchiveFailurePropagation(unittest.TestCase):
+    """Test that archive creation failures are propagated to the parent process."""
+
+    def test_archive_error_returns_custom_exit_code(self):
+        from rdiffweb.core.restore import _restore, CUST_EXIT_CODE
+
+        mock_rdiff = b'/usr/bin/rdiff-backup'
+        mock_dest = MagicMock()
+
+        with patch('rdiffweb.core.restore.subprocess.Popen') as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.stdout = iter([b'Processing changed file test.txt\n'])
+            mock_proc.wait.return_value = 0
+            mock_proc.poll.return_value = None
+            mock_popen.return_value = mock_proc
+
+            with patch('rdiffweb.core.restore._lookup_filename', return_value=(b'/tmp/test.txt', b'test.txt')):
+                with patch('os.path.isdir', return_value=False):
+                    with patch('os.path.isfile', return_value=True):
+                        with patch('os.lstat') as mock_lstat:
+                            mock_lstat.return_value = MagicMock(st_mode=0o100644)
+
+                            with patch('rdiffweb.core.restore.ARCHIVERS', {'raw': MagicMock(side_effect=OSError('disk full'))}):
+                                result = _restore(
+                                    mock_rdiff,
+                                    b'/test/path',
+                                    1234567890,
+                                    'raw',
+                                    'utf-8',
+                                    mock_dest,
+                                    send_header=True,
+                                )
+
+                                self.assertEqual(result, CUST_EXIT_CODE, 'archive failure must return CUST_EXIT_CODE')
 
 
 class TestCriticalStateTransitions(unittest.TestCase):

@@ -71,9 +71,11 @@ class _file_generator(object):
     Yield the given input (a file object) in chunks (default 64k).
     Properly closes the underlying stream when iteration ends or is aborted.
 
-    Integrates with RestoreState:
+    Integrates with RestoreState via _wrap_close:
       - Calls mark_transfer_complete() when all content is transferred
-      - Calls abort() on disconnection or exception
+      - Calls abort() on disconnection or exception before close
+      - After abort or transfer_complete, always calls close() to
+        reap the child process and finalize the state machine
     """
 
     def __init__(self, input, chunkSize=65536):
@@ -81,7 +83,6 @@ class _file_generator(object):
         self.chunkSize = chunkSize
         self._closed = False
         self._transfer_complete = False
-        # Check if input has restore state management (_wrap_close)
         self._has_restore_state = hasattr(input, 'mark_transfer_complete') and hasattr(input, 'abort')
 
     def __iter__(self):
@@ -95,7 +96,6 @@ class _file_generator(object):
             if chunk:
                 return chunk
             else:
-                # Phase 3 complete: all content transferred to client
                 if self._has_restore_state and not self._transfer_complete:
                     self._transfer_complete = True
                     try:
@@ -104,8 +104,9 @@ class _file_generator(object):
                         logger.exception('fail to mark transfer complete')
                 self.close()
                 raise StopIteration()
+        except StopIteration:
+            raise
         except Exception as e:
-            # Browser disconnected or I/O error during transfer
             if self._has_restore_state and not self._closed:
                 try:
                     self.input.abort(f'client disconnected: {e}')
@@ -120,14 +121,12 @@ class _file_generator(object):
         if self._closed:
             return
         self._closed = True
-        # If transfer wasn't marked complete and we have state management,
-        # this is an aborted transfer (e.g., explicit close before end)
         if self._has_restore_state and not self._transfer_complete:
             try:
                 self.input.abort('transfer aborted by client')
             except Exception:
                 logger.exception('fail to abort restore on close')
-        elif hasattr(self.input, 'close'):
+        if hasattr(self.input, 'close'):
             try:
                 self.input.close()
             except Exception:

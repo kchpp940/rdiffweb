@@ -335,9 +335,11 @@ class _wrap_close:
         - Browser disconnects mid-transfer
         - Exception during iteration
         - Explicit close before end of stream
+
+        Only updates the state machine. The caller (_file_generator) is
+        responsible for calling close() afterward to reap the child process.
         """
         self._state.abort(reason)
-        self.close()
 
     def _set_stream_established(self):
         """Internal: mark that 'ok' header was received (phase 2 complete).
@@ -549,6 +551,7 @@ def _restore(rdiff_backup, path, restore_as_of, kind, encoding, dest, env={}, se
     archive = None
     proc = None
     header_sent = False
+    _archive_error = None
     try:
         try:
             proc = subprocess.Popen(
@@ -594,11 +597,12 @@ def _restore(rdiff_backup, path, restore_as_of, kind, encoding, dest, env={}, se
                     # Then send archive.
                     archive = ARCHIVERS[kind](dest)
                 archive.addfile(fullpath, arcname, encoding)
-            except Exception:
+            except Exception as e:
                 # Many error may happen when trying to add a file to the
                 # archive. To be more resilient, capture error and continue
                 # with the next file.
                 logger.debug('error: fail to add %r' % fullpath, exc_info=1)
+                _archive_error = str(e)
 
             # Delete file once added to the archive.
             try:
@@ -612,9 +616,16 @@ def _restore(rdiff_backup, path, restore_as_of, kind, encoding, dest, env={}, se
         return_code = proc.wait()
         proc = None
 
+        if _archive_error:
+            if send_header and not header_sent:
+                dest.write(b'fail\n')
+                dest.write(f'archive creation failed: {_archive_error}'.encode('utf-8', 'replace') + b'\n')
+                dest.flush()
+            return CUST_EXIT_CODE
+
         # If no files were processed but we need to send header, send fail
         if send_header and not header_sent:
-            if return_code == 0:
+            if return_code == 0 and not _archive_error:
                 # For empty directories, still send ok
                 dest.write(b'ok\n')
                 dest.flush()
