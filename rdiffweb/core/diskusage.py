@@ -29,6 +29,11 @@ from rdiffweb.core.model._diskusage import normalize_logical_path
 CONTEXT = 'DISKUSAGE'
 
 
+class _ScanSuperseded(Exception):
+    """Raised internally when a scan loses the optimistic concurrency race."""
+    pass
+
+
 class DiskUsagePlugin(SimplePlugin):
     """
     Periodically scan backup storage and update disk usage for each repository
@@ -179,56 +184,89 @@ class DiskUsagePlugin(SimplePlugin):
 
     def _commit_scan(self, scan_id, repoid, usage):
         """
-        Commit collected data for a scan atomically.
+        Commit collected data for a scan with database-agnostic optimistic
+        concurrency control.
 
-        Uses a row-level lock on the RepoObject row to guarantee that only
-        one pending scan can commit at a time for a given repository.
+        Uses an atomic conditional UPDATE instead of ``SELECT ... FOR UPDATE``
+        so that the same logic works correctly on SQLite, PostgreSQL, MySQL,
+        and any other backend (even those without row-level locking).
 
-        Within the lock:
-        - Re-checks that no newer completed scan exists.
-        - Inserts DiskUsage rows linked to this scan_id.
-        - Marks this scan as completed.
-        - Explicitly deletes data from older scans.
+        Within the transaction:
+        1. Insert all DiskUsage rows linked to this scan_id.
+        2. Execute a single conditional UPDATE on RepoDiskUsageScan:
+           - Must still be ``pending``.
+           - Must NOT have any newer completed scan for the same repo.
+        3. If the UPDATE affected 0 rows, raise ``_ScanSuperseded`` so the
+           transaction rolls back (including the DiskUsage inserts).
+        4. If the UPDATE succeeded, explicitly delete data from older scans.
 
-        Returns True if the scan was committed, False if it was superseded.
+        Returns True if the scan was committed. Raises ``_ScanSuperseded`` if
+        a concurrent scan committed first.
         """
+        from datetime import datetime, timezone
+        from sqlalchemy import and_, exists, not_, update as sa_update
+
         entries = [
             (logical_path, mirror_size, increments_size)
             for logical_path, (mirror_size, increments_size) in usage.items()
         ]
 
         with cherrypy.db.session.begin():
-            # Acquire a row lock on the RepoObject.  This serialises all
-            # commit-scan operations for the same repo, so two pending
-            # scans cannot both observe the same "latest completed" state
-            # and then race to write.  Works on SQLite (table-level) and
-            # PostgreSQL (row-level).
-            repo = (
-                RepoObject.query.filter(RepoObject.id == repoid)
-                .with_for_update()
-                .one_or_none()
-            )
-            if repo is None:
-                raise RuntimeError(f'repo {repoid} no longer exists during scan commit')
-
-            # Under the lock, re-read the latest completed scan.
             scan = RepoDiskUsageScan.query.filter_by(id=scan_id).one()
             if scan.status != RepoDiskUsageScan.STATUS_PENDING:
                 raise RuntimeError(f'scan {scan_id} is no longer pending (status={scan.status})')
 
-            latest = RepoDiskUsageScan.get_latest_completed(repoid)
-            if latest is not None and latest.id > scan_id:
-                scan.mark_failed(f'superseded by newer scan {latest.id}')
-                cherrypy.log(
-                    f'scan {scan_id} superseded by newer scan {latest.id} for repo {repoid}',
-                    context=CONTEXT,
-                )
-                return False
-
+            # Insert all rows for this scan
             DiskUsage.replace_for_scan(scan_id, repoid, entries)
+            cherrypy.db.session.flush()
 
-            scan.mark_completed(len(entries))
+            now = datetime.now(tz=timezone.utc)
 
+            # --- Database-agnostic optimistic concurrency check ---
+            # Atomically try to transition pending → completed, conditional
+            # on (a) scan still pending, (b) no newer completed scan exists.
+            # This is a single UPDATE statement, so it is atomic on all ACID
+            # databases regardless of isolation level or locking granularity.
+            newer_completed_exists = (
+                exists().where(
+                    and_(
+                        RepoDiskUsageScan.repoid == repoid,
+                        RepoDiskUsageScan.status == RepoDiskUsageScan.STATUS_COMPLETED,
+                        RepoDiskUsageScan.id > scan_id,
+                    )
+                )
+            )
+
+            update_stmt = (
+                sa_update(RepoDiskUsageScan)
+                .where(
+                    and_(
+                        RepoDiskUsageScan.id == scan_id,
+                        RepoDiskUsageScan.status == RepoDiskUsageScan.STATUS_PENDING,
+                        not_(newer_completed_exists),
+                    )
+                )
+                .values(
+                    status=RepoDiskUsageScan.STATUS_COMPLETED,
+                    completed_at=now,
+                    total_paths=len(entries),
+                    error_message=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+
+            result = cherrypy.db.session.execute(update_stmt)
+            rows_updated = result.rowcount
+
+            if rows_updated == 0:
+                # Another scan got there first.  Raise so the transaction rolls
+                # back (undoing the DiskUsage inserts above).  The caller will
+                # mark the scan as 'failed' in a separate, new transaction.
+                raise _ScanSuperseded(
+                    f'scan {scan_id} superseded by concurrent commit for repo {repoid}'
+                )
+
+            # Commit succeeded; now clean up older scans.
             DiskUsage.remove_old_scans_for_repo(repoid, keep_scan_id=scan_id)
 
         return True
@@ -271,16 +309,18 @@ class DiskUsagePlugin(SimplePlugin):
 
                 usage = self._collect_repo_usage(repo_obj)
 
-                committed = self._commit_scan(scan_id, repo_obj.id, usage)
-                if committed:
-                    success_count += 1
-                    cherrypy.log(
-                        f'scan {scan_id} completed for repository {repo_path!r} ({len(usage)} paths)',
-                        context=CONTEXT,
-                    )
-                else:
-                    superseded_count += 1
+                self._commit_scan(scan_id, repo_obj.id, usage)
+                success_count += 1
+                cherrypy.log(
+                    f'scan {scan_id} completed for repository {repo_path!r} ({len(usage)} paths)',
+                    context=CONTEXT,
+                )
 
+            except _ScanSuperseded as e:
+                superseded_count += 1
+                if scan_id is not None:
+                    self._mark_scan_failed(scan_id, str(e))
+                cherrypy.log(str(e), context=CONTEXT)
             except Exception as e:
                 fail_count += 1
                 if scan_id is not None:

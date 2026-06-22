@@ -168,23 +168,20 @@ class DiskUsage(Base):
         return latest_completed_id
 
     @classmethod
-    def active_query(cls, repoid):
+    def active_filter(cls, repoid):
         """
-        Return a query object pre-filtered to only include "active" DiskUsage
-        rows for ``repoid``.
+        Return a SQLAlchemy filter expression for active DiskUsage rows of
+        ``repoid``.  This is the single source of truth used by
+        :meth:`active_query`, page_home, and any other code that needs to
+        query active disk usage data — ensuring all three entry points see
+        the same rows.
 
-        Active-row selection logic:
-        1. If a completed scan exists for the repo: only rows whose
-           ``scan_id`` matches the latest completed scan are active.
-        2. If NO completed scan exists: every row for the repo is active
-           (covers legacy data without scan_id, and migration failures).
-        3. Rows from pending / failed scans are never visible.
-
-        This method does NOT rely on cascade-delete to remove old data.
+        The filter expression is self-contained and uses only correlated
+        subqueries, so it can be combined with additional filters freely.
         """
         from sqlalchemy import and_, or_, select as sa_select
 
-        latest_completed_id = (
+        latest_id = (
             sa_select(RepoDiskUsageScan.id)
             .where(
                 RepoDiskUsageScan.repoid == repoid,
@@ -195,27 +192,39 @@ class DiskUsage(Base):
             .scalar_subquery()
         )
 
-        has_any_completed = (
+        latest_count = (
             sa_select(func.count())
             .where(
-                RepoDiskUsageScan.repoid == repoid,
-                RepoDiskUsageScan.status == RepoDiskUsageScan.STATUS_COMPLETED,
+                cls.repoid == repoid,
+                cls.scan_id == latest_id,
             )
             .scalar_subquery()
         )
 
-        return cls.query.filter(
+        return and_(
             cls.repoid == repoid,
             or_(
-                # Case A: there are completed scans; only rows of latest completed are active
                 and_(
-                    has_any_completed > 0,
-                    cls.scan_id == latest_completed_id,
+                    latest_id.isnot(None),
+                    latest_count > 0,
+                    cls.scan_id == latest_id,
                 ),
-                # Case B: no completed scans yet; show all rows including legacy (scan_id IS NULL)
-                has_any_completed == 0,
+                or_(
+                    latest_id.is_(None),
+                    latest_count == 0,
+                ),
             ),
         )
+
+    @classmethod
+    def active_query(cls, repoid):
+        """
+        Return a query object pre-filtered to only include "active" DiskUsage
+        rows for ``repoid``.
+
+        See :meth:`active_filter` for the active-row selection logic.
+        """
+        return cls.query.filter(cls.active_filter(repoid))
 
     @classmethod
     def replace_for_scan(cls, scan_id, repoid, entries):
