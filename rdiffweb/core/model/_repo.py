@@ -15,12 +15,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import codecs
 import encodings
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import cherrypy
+
+logger = logging.getLogger(__name__)
 from cherrypy_foundation.tools.i18n import ugettext as _
 from sqlalchemy import Column, ForeignKey, Integer, SmallInteger, String
 from sqlalchemy import __version__ as sqlalchemy_version

@@ -101,12 +101,16 @@ def unquote(name):
     # This function just gives back the original text if it can decode it
     def unquoted_char(match):
         """For each ;000 return the corresponding byte."""
+        # ;090 is 4 chars: semicolon + 3 digits
         if len(match.group()) != 4:
-            return match.group
+            return match.group()
         try:
-            return bytes([int(match.group()[1:])])
+            val = int(match.group()[1:])
+            if val > 255:
+                return match.group()
+            return bytes([val])
         except ValueError:
-            return match.group
+            return match.group()
 
     # Remove quote using regex
     return re.sub(pattern=b";[0-9]{3}", repl=unquoted_char, string=name, flags=re.S)

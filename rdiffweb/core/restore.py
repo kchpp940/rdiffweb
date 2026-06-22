@@ -171,13 +171,14 @@ class _wrap_close:
         self._success = False
 
     def set_success(self):
-        """Mark the restore operation as successfully started."""
+        """Mark the restore operation as successfully started.
+
+        This only sets the success flag. The actual success callback
+        will be invoked in close() after the process exits with code 0.
+        This prevents calling the callback twice and ensures we only
+        log success after the process has actually started successfully.
+        """
         self._success = True
-        if self._success_callback:
-            try:
-                self._success_callback()
-            except Exception:
-                logger.exception('success callback failed')
 
     def close(self):
         if self._closed:
@@ -209,6 +210,12 @@ class _wrap_close:
                         logger.exception('success callback failed')
             except ChildProcessError:
                 logger.exception('fail to get child process exit status')
+                # Process already exited, assume success if marked
+                if self._success and self._success_callback:
+                    try:
+                        self._success_callback()
+                    except Exception:
+                        logger.exception('success callback failed')
             except Exception:
                 logger.exception('fail to wait for child process')
 
@@ -216,11 +223,17 @@ class _wrap_close:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None and self._failure_callback:
-            try:
-                self._failure_callback(None)
-            except Exception:
-                logger.exception('failure callback failed')
+        # If there was an exception, mark success as false so close() won't
+        # call the success callback. The failure callback will be called in
+        # close() if we can determine the exit code, or we call it here with
+        # None to indicate an unexpected exception.
+        if exc_type is not None:
+            self._success = False
+            if self._failure_callback and self._return_code is None:
+                try:
+                    self._failure_callback(None)
+                except Exception:
+                    logger.exception('failure callback failed')
         self.close()
 
     def __getattr__(self, name):
@@ -304,6 +317,7 @@ def pipe_restore(rdiff_backup, path, restore_as_of, kind, encoding, env={}, succ
         # This could later be expended to transport more status information.
         fileobj = os.fdopen(rfile, 'rb')
         wrapper = _wrap_close(fileobj, pid, success_callback=success_callback, failure_callback=failure_callback)
+        header_ok = False
         try:
             # Expect "ok", then file content
             header_status = fileobj.readline()
@@ -313,15 +327,15 @@ def pipe_restore(rdiff_backup, path, restore_as_of, kind, encoding, env={}, succ
                     error_msg = fileobj.readline().strip()
                 except Exception:
                     pass
-                wrapper.close()
                 if error_msg:
                     raise RestoreException(error_msg.decode('utf-8', 'replace'))
                 raise RestoreException('restore failed to start')
+            header_ok = True
             wrapper.set_success()
             return wrapper
-        except Exception:
-            wrapper.close()
-            raise
+        finally:
+            if not header_ok:
+                wrapper.close()
 
     else:
         # Child - Close unused end
