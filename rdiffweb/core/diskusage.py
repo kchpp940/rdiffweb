@@ -34,6 +34,124 @@ class _ScanSuperseded(Exception):
     pass
 
 
+class _PathClassificationError(Exception):
+    """Raised when a du output path cannot be safely classified."""
+    pass
+
+
+def _safe_is_within(prefix_path, target_path, root_path):
+    """
+    Determine if ``target_path`` is strictly under ``prefix_path`` (a proper
+    child directory) and that the computed relative path does not escape
+    ``root_path`` after normalization.
+
+    Returns the normalised relative path (bytes) on success, or ``None`` if
+    the target is not a proper child of the prefix or if the relative path
+    would escape the root.
+
+    Uses ``os.path.commonpath`` as an additional guard against prefix
+    collisions like ``/repo/foo`` falsely matching ``/repo/foobar``.
+    """
+    try:
+        norm_prefix = os.path.normpath(prefix_path)
+        norm_target = os.path.normpath(target_path)
+        norm_root = os.path.normpath(root_path)
+
+        if norm_prefix == norm_target:
+            return None
+
+        try:
+            common = os.path.commonpath([norm_prefix, norm_target])
+        except ValueError:
+            return None
+
+        if common != norm_prefix:
+            return None
+
+        rel = os.path.relpath(norm_target, norm_prefix)
+        if isinstance(rel, str):
+            rel = rel.encode('utf-8', errors='surrogateescape')
+
+        # Path-escape guard: if ``..`` appears after normalization the path
+        # would escape the prefix tree.  We check by re-joining and comparing
+        # to the original prefix.
+        rejoined = os.path.normpath(os.path.join(norm_prefix, rel))
+        if rejoined != norm_target:
+            return None
+
+        # Root-level guard: make sure the relative path does not reference
+        # anything above root_path when joined back.
+        rejoined_root = os.path.normpath(os.path.join(norm_root, rel))
+        try:
+            if os.path.commonpath([norm_root, rejoined_root]) != norm_root:
+                return None
+        except ValueError:
+            return None
+
+        return rel
+
+    except (UnicodeDecodeError, UnicodeEncodeError, TypeError, ValueError):
+        return None
+
+
+def _validate_and_normalize_logical(raw_rel, repo_path):
+    """
+    Validate a raw relative path produced by relpath() and normalize it for
+    use as a logical_path key.
+
+    Raises ``_PathClassificationError`` for paths that cannot be safely used:
+    - empty or null bytes
+    - ``..`` components that escape the repo root
+    - control characters or null bytes inside the path
+
+    Returns a normalized bytes path, or ``b'.'`` for the repo root.
+    """
+    if raw_rel is None:
+        raise _PathClassificationError('null path')
+
+    if isinstance(raw_rel, str):
+        try:
+            raw_rel = raw_rel.encode('utf-8', errors='surrogateescape')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            raise _PathClassificationError(f'cannot encode path: {raw_rel!r}')
+    elif not isinstance(raw_rel, bytes):
+        raise _PathClassificationError(f'path has wrong type: {type(raw_rel).__name__}')
+
+    # Reject paths with embedded null bytes (would truncate or corrupt)
+    if b'\x00' in raw_rel:
+        raise _PathClassificationError(f'path contains null byte: {raw_rel!r}')
+
+    # Strip leading/trailing slashes and normalize . and ..
+    stripped = raw_rel.strip(b'/')
+    if stripped == b'' or stripped == b'.':
+        return b'.'
+
+    normalized = os.path.normpath(stripped)
+
+    # After normpath, guard against escape via '..' components that would
+    # walk above the repo root.
+    if normalized.startswith(b'..') or normalized == b'..':
+        raise _PathClassificationError(f'path escapes repo root: {raw_rel!r}')
+
+    # Reject standalone '.' that wasn't handled above (shouldn't happen, but be safe)
+    if normalized == b'.':
+        return b'.'
+
+    # Final safety check: re-join with the repo root and verify we're still
+    # inside the repo tree.
+    try:
+        rejoined = os.path.normpath(os.path.join(repo_path, normalized))
+        common = os.path.commonpath([os.path.normpath(repo_path), rejoined])
+        if common != os.path.normpath(repo_path):
+            raise _PathClassificationError(
+                f'normalized path escapes repo root: {raw_rel!r} -> {normalized!r}'
+            )
+    except (ValueError, TypeError):
+        raise _PathClassificationError(f'path fails containment check: {raw_rel!r}')
+
+    return normalized
+
+
 class DiskUsagePlugin(SimplePlugin):
     """
     Periodically scan backup storage and update disk usage for each repository
@@ -84,6 +202,11 @@ class DiskUsagePlugin(SimplePlugin):
         """
         Run `du` on the given path and return a list of ``(size_bytes, subpath)`` tuples.
 
+        ``du`` is invoked with ``-x`` (--one-file-system) to prevent following
+        symlinks / mount points that would cause the same physical directory
+        tree to be counted multiple times, and to stop du from crossing FS
+        boundaries into unrelated storage.
+
         Raises ``RuntimeError`` if du fails (non-zero exit code) or cannot be started.
         """
         cmd = []
@@ -96,7 +219,11 @@ class DiskUsagePlugin(SimplePlugin):
         if nice:
             cmd += [nice, b'-n', str(self.nice_level).encode()]
 
-        cmd += [b'du', b'--block-size=1', path]
+        # -x, --one-file-system        skip directories on different filesystems
+        # This blocks du from following symlinks that point outside the repo
+        # and from crossing mount points into other backups, which would
+        # cause the same physical directory to be counted several times.
+        cmd += [b'du', b'--block-size=1', b'-x', path]
 
         try:
             process = subprocess.Popen(
@@ -114,9 +241,20 @@ class DiskUsagePlugin(SimplePlugin):
             if len(parts) == 2:
                 size_str, subpath = parts
                 try:
-                    results.append((int(size_str), subpath))
+                    size = int(size_str)
                 except ValueError:
-                    cherrypy.log(f'unexpected du output line {line!r}', severity=logging.WARNING, context=CONTEXT)
+                    cherrypy.log(
+                        f'unexpected du output line (bad size): {line!r}',
+                        severity=logging.WARNING, context=CONTEXT,
+                    )
+                    continue
+                if size < 0:
+                    cherrypy.log(
+                        f'unexpected du output line (negative size): {line!r}',
+                        severity=logging.WARNING, context=CONTEXT,
+                    )
+                    continue
+                results.append((size, subpath))
             else:
                 cherrypy.log(f'du unexpected output: {line!r}', severity=logging.WARNING, context=CONTEXT)
 
@@ -131,34 +269,102 @@ class DiskUsagePlugin(SimplePlugin):
         Scan a single repository and return a dict keyed by normalized logical path
         with ``(mirror_size, increments_size)`` tuples.
 
-        The entire repo scan either succeeds fully or raises an exception;
-        partial results are never returned.
+        Path classification rules (strictly matches rdiff-backup layout):
+
+        *   ``<repo_root>/rdiff-backup-data/increments/<path>``  →  increments side
+            of ``<path>``.
+        *   Everything else *inside* ``rdiff-backup-data`` is ignored (metadata,
+            error logs, etc.).
+        *   Everything else *outside* ``rdiff-backup-data`` is the mirror side,
+            with the repo root corresponding to logical path ``b'.'``.
+
+        Safety rules:
+        *   ``du -x`` prevents symlink-following double-counting before we even
+            see the output.
+        *   Every path is checked for exact containment (``os.path.commonpath``),
+            not just ``startswith``, so ``rdiff-backup-data/increments-old/``
+            won't be mis-classified as increments.
+        *   Relative paths that would escape the repo tree after normalisation
+            are rejected individually.
+        *   ``mirror_size`` and ``increments_size`` are written at most once
+            per logical path; a duplicate assignment raises ``RuntimeError`` and
+            aborts the repo scan — no wrong statistic can land in the DB.
+
+        Raises ``RuntimeError`` on any unrecoverable problem.  Partial results
+        are never returned.
         """
         repo_path = repo_obj.full_path
         if not os.path.isdir(repo_path):
             raise RuntimeError(f"repository folder doesn't exist: {repo_path!r}")
 
-        rdiff_data = os.path.join(repo_path, b'rdiff-backup-data')
+        norm_repo_path = os.path.normpath(repo_path)
+        rdiff_data = os.path.join(norm_repo_path, b'rdiff-backup-data')
         increments_prefix = os.path.join(rdiff_data, b'increments')
 
         raw_entries = self._run_du(repo_path)
 
+        # usage[logical_path] = [mirror_size, increments_size]
+        # Using a list (instead of tuple) so we can mutate in place while
+        # guarding against double-setting — see the asserts below.
         usage = {}
-        for size, subpath in raw_entries:
-            if subpath.startswith(increments_prefix):
-                raw_rel = os.path.relpath(subpath, increments_prefix)
-                logical = normalize_logical_path(raw_rel)
-                mirror, incr = usage.get(logical, (None, None))
-                usage[logical] = (mirror, size)
-            elif subpath.startswith(rdiff_data):
-                continue
-            else:
-                raw_rel = os.path.relpath(subpath, repo_path)
-                logical = normalize_logical_path(raw_rel)
-                mirror, incr = usage.get(logical, (None, None))
-                usage[logical] = (size, incr)
+        skipped_count = 0
 
-        return usage
+        for size, subpath in raw_entries:
+            try:
+                # 1) Increments tree?
+                inc_rel = _safe_is_within(increments_prefix, subpath, norm_repo_path)
+                if inc_rel is not None:
+                    logical = _validate_and_normalize_logical(inc_rel, norm_repo_path)
+                    slot = usage.setdefault(logical, [None, None])
+                    if slot[1] is not None:
+                        raise RuntimeError(
+                            f'increments_size set twice for {logical!r} in repo {repo_path!r}'
+                        )
+                    slot[1] = size
+                    continue
+
+                # 2) Inside rdiff-backup-data but NOT increments → ignore
+                rd_rel = _safe_is_within(rdiff_data, subpath, norm_repo_path)
+                if rd_rel is not None:
+                    continue
+
+                # 3) Mirror tree (the user-visible backup)
+                mirror_rel = _safe_is_within(norm_repo_path, subpath, norm_repo_path)
+                if mirror_rel is not None:
+                    logical = _validate_and_normalize_logical(mirror_rel, norm_repo_path)
+                    slot = usage.setdefault(logical, [None, None])
+                    if slot[0] is not None:
+                        raise RuntimeError(
+                            f'mirror_size set twice for {logical!r} in repo {repo_path!r}'
+                        )
+                    slot[0] = size
+                    continue
+
+                # 4) Path that doesn't fit any category → skip this entry and log
+                skipped_count += 1
+                cherrypy.log(
+                    f'skipping unclassifiable path {subpath!r} in repo {repo_path!r}',
+                    severity=logging.WARNING, context=CONTEXT,
+                )
+
+            except _PathClassificationError as e:
+                skipped_count += 1
+                cherrypy.log(
+                    f'skipping bad path {subpath!r} in repo {repo_path!r}: {e}',
+                    severity=logging.WARNING, context=CONTEXT,
+                )
+
+        if skipped_count:
+            cherrypy.log(
+                f'skipped {skipped_count} unclassifiable entries for repo {repo_path!r}',
+                severity=logging.INFO, context=CONTEXT,
+            )
+
+        # Final consistency check: every logical_path has at least one side
+        # set (which it will by construction) and the canonical key used is
+        # already the normalised one.  Convert list slots to tuples for the
+        # returned dict.
+        return {k: (v[0], v[1]) for k, v in usage.items()}
 
     def _create_scan(self, repoid):
         """Create a pending scan record and return its id."""
