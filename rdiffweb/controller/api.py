@@ -22,66 +22,8 @@ import cherrypy
 from rdiffweb.controller.api_currentuser import ApiCurrentUser
 from rdiffweb.controller.api_openapi import OpenAPI
 from rdiffweb.controller.page_admin_users import AdminApiUsers
-from rdiffweb.tools.api_auth import AuthMethod, resolve_api_auth
 
 logger = logging.getLogger(__name__)
-
-
-def _checkpassword(realm, username, password):
-    """
-    Basic auth callback used by cherrypy.tools.auth_basic.
-
-    Delegates to resolve_api_auth() for unified authentication logic
-    (token validation, expiration check, MFA restriction, access_time
-    update, scope assignment).  On success the AuthResult is applied
-    to the request; on failure the rate limiter is incremented.
-    """
-    auth = resolve_api_auth(username=username, password=password)
-
-    if auth.is_valid:
-        auth.apply_to_request()
-        return True
-
-    # Increment rate limiter on any authentication failure.
-    cherrypy.tools.ratelimit.increase_hit()
-    return False
-
-
-def _resolve_api_auth_for_session():
-    """
-    Post-authentication hook that runs for every API request.
-
-    If auth_basic already resolved authentication (via _checkpassword),
-    the request already has api_auth and scope — nothing to do.
-
-    If the request was authenticated via session (cherrypy.tools.auth),
-    this is the first opportunity to create an AuthResult.  Session
-    users get 'all' scope because they completed the full interactive
-    auth flow (including MFA if enabled).
-
-    If no authentication is present at all, a failed AuthResult is
-    applied so that downstream code gets a consistent object.
-
-    Priority 75: after auth_basic (70) and auth (72), before
-    required_scope (85).
-    """
-    request = cherrypy.serving.request
-
-    # Already resolved by auth_basic path.
-    if hasattr(request, 'api_auth') and request.api_auth is not None:
-        return
-
-    auth = resolve_api_auth()
-    if auth.is_valid:
-        auth.apply_to_request()
-    else:
-        # Ensure api_auth always exists, even for unauthenticated requests.
-        # required_scope will raise 403 if scope is empty.
-        auth.apply_to_request()
-
-
-# Register the auth-resolve tool. Priority 75 = after auth, before required_scope.
-cherrypy.tools.resolve_api_auth = cherrypy.Tool('before_handler', _resolve_api_auth_for_session, priority=75)
 
 
 def _api_json_error():
@@ -137,9 +79,7 @@ cherrypy.tools.api_json_error = cherrypy.Tool('before_error_response', _api_json
 @cherrypy.tools.allow(on=False)
 @cherrypy.tools.json_out(on=True)
 @cherrypy.tools.json_in(on=True, force=False)
-@cherrypy.tools.auth_basic(realm='rdiffweb', checkpassword=_checkpassword, priority=70)
-@cherrypy.tools.auth(on=True, redirect=False)
-@cherrypy.tools.resolve_api_auth()
+@cherrypy.tools.api_authenticate()
 @cherrypy.tools.api_json_error()
 @cherrypy.tools.auth_mfa(on=False)
 @cherrypy.tools.i18n(on=False)

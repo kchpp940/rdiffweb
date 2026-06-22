@@ -65,7 +65,7 @@ class OpenAPI:
 
     _ERROR_RESPONSES = {
         "400": {
-            "description": "Bad Request - Invalid input parameters",
+            "description": "Bad Request - Invalid input parameters (e.g. unsupported field, malformed JSON body).",
             "content": {
                 "application/json": {
                     "schema": {
@@ -73,14 +73,20 @@ class OpenAPI:
                         "properties": {
                             "code": {"type": "integer", "example": 400},
                             "status": {"type": "string", "example": "400 Bad Request"},
-                            "message": {"type": "string", "example": "Invalid field: foo"},
+                            "message": {"type": "string", "example": "unsupported field: invalid_field"},
                         },
                     }
                 }
             },
         },
         "401": {
-            "description": "Unauthorized - Authentication required",
+            "description": (
+                "Unauthorized - Authentication failed. Possible reasons:\n"
+                "- Missing or malformed Authorization header (`not_authenticated`)\n"
+                "- Invalid username or password (`invalid_credentials`)\n"
+                "- Access token has expired (`token_expired`)\n"
+                "- MFA is enabled on the account; password auth is not available via the API (`mfa_required`)"
+            ),
             "content": {
                 "application/json": {
                     "schema": {
@@ -88,14 +94,18 @@ class OpenAPI:
                         "properties": {
                             "code": {"type": "integer", "example": 401},
                             "status": {"type": "string", "example": "401 Unauthorized"},
-                            "message": {"type": "string", "example": ""},
+                            "message": {"type": "string", "example": "MFA is enabled; password authentication is not available via the API"},
                         },
                     }
                 }
             },
         },
         "403": {
-            "description": "Forbidden - Insufficient scope or permissions",
+            "description": (
+                "Forbidden - Authenticated but lacks the required scope or role. Possible reasons:\n"
+                "- Access token does not include the scope required by this endpoint (`invalid_scope`)\n"
+                "- User is not an admin but called an admin endpoint"
+            ),
             "content": {
                 "application/json": {
                     "schema": {
@@ -110,7 +120,7 @@ class OpenAPI:
             },
         },
         "404": {
-            "description": "Not Found - Resource does not exist",
+            "description": "Not Found - The requested resource does not exist (e.g. unknown repo, unknown token, unknown user).",
             "content": {
                 "application/json": {
                     "schema": {
@@ -312,21 +322,45 @@ class OpenAPI:
                 "description": (
                     "rdiffweb REST API\n\n"
                     "## Authentication\n\n"
-                    "The API supports two authentication methods:\n"
-                    "- **Basic Auth**: Use your username and password (session-based users get `all` scope).\n"
-                    "- **Access Token**: Use an access token as the password (username can be anything).\n"
-                    "  Tokens have a limited set of scopes that determine which endpoints are accessible.\n\n"
+                    "The API uses a single unified authentication path. A request is\n"
+                    "resolved in exactly one of the following mutually exclusive ways:\n\n"
+                    "1. **Access Token (Basic Auth header)** — If the `Authorization: Basic`\n"
+                    "   header is present and the password matches a non-expired access\n"
+                    "   token for the given username, the token's scope list is applied.\n"
+                    "   The token's `access_time` is updated on each successful request.\n"
+                    "   **No fallback to password auth occurs once a token matches.**\n\n"
+                    "2. **Username + Password (Basic Auth header)** — If the Basic Auth\n"
+                    "   header is present but the password does not match any token,\n"
+                    "   the server attempts a normal credentials check. Users with MFA\n"
+                    "   enabled are **always rejected with 401** (MFA requires the UI\n"
+                    "   flow). On success the scope `['all']` is granted.\n\n"
+                    "3. **Session (no Basic Auth header)** — If no `Authorization`\n"
+                    "   header is sent and a valid session cookie exists, the request\n"
+                    "   is authenticated as that session user with scope `['all']`.\n"
+                    "   Sessions are normally disabled on `/api/*` paths, so this path\n"
+                    "   is only available on explicitly configured endpoints.\n\n"
+                    "Requests that fail authentication receive **401 Unauthorized**\n"
+                    "with a `reject_reason` in the JSON body (`not_authenticated`,\n"
+                    "`invalid_credentials`, `token_expired`, `mfa_required`).\n\n"
+                    "Authenticated requests that lack the required scope receive\n"
+                    "**403 Forbidden**.\n\n"
                     "## Scopes\n\n"
                     + "\n".join([f"- **{name}**: {desc}" for name, desc in SCOPE_DEFS.items()])
                     + "\n\n## Error Responses\n\n"
                     "All error responses follow the same JSON format:\n"
                     "```json\n"
                     "{\n"
-                    '  "code": 400,\n'
-                    '  "status": "400 Bad Request",\n'
-                    '  "message": "error description"\n'
+                    '  "code": 401,\n'
+                    '  "status": "401 Unauthorized",\n'
+                    '  "message": "MFA is enabled; password authentication is not available via the API"\n'
                     "}\n"
-                    "```"
+                    "```\n\n"
+                    "| HTTP code | Meaning and possible reject_reason |\n"
+                    "|-----------|------------------------------------|\n"
+                    "| 400       | Bad Request — malformed input or unsupported field |\n"
+                    "| 401       | Unauthorized — `not_authenticated`, `invalid_credentials`, `token_expired`, `mfa_required` |\n"
+                    "| 403       | Forbidden — authenticated but insufficient scope or admin role |\n"
+                    "| 404       | Not Found — resource does not exist |\n"
                 ),
                 "version": version,
             },
