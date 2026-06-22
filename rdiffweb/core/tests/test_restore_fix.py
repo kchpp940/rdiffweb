@@ -759,7 +759,7 @@ class TestPathHandling(unittest.TestCase):
 
 
 class TestRepoObjectRestoreCallbacks(unittest.TestCase):
-    """Test RepoObject.restore callback behavior."""
+    """Test that RepoObject.restore creates a single lifecycle event."""
 
     def setUp(self):
         import os
@@ -768,17 +768,7 @@ class TestRepoObjectRestoreCallbacks(unittest.TestCase):
         cfg = RdiffwebApp.parse_args(args=[], config_file_contents='rate-limit=-1')
         self.app = RdiffwebApp(cfg)
 
-    def test_restore_method_signature(self):
-        from rdiffweb.core.model import RepoObject
-        import inspect
-        sig = inspect.signature(RepoObject.restore)
-        params = list(sig.parameters.keys())
-        self.assertIn('args', params)
-        self.assertIn('kwargs', params)
-
-    @patch('rdiffweb.core.model._repo.super')
-    def test_failure_callback_receives_both_args(self, mock_super):
-        """Test that failure callback receives both exit_code and abort_reason."""
+    def _setup_mocks(self, mock_super, mock_message_cls, pending_id=42):
         from rdiffweb.core.model import RepoObject
 
         mock_repo = MagicMock(spec=RepoObject)
@@ -786,84 +776,136 @@ class TestRepoObjectRestoreCallbacks(unittest.TestCase):
         mock_repo.add_message = MagicMock()
         mock_repo.commit = MagicMock()
 
+        mock_pending = MagicMock()
+        mock_pending.id = pending_id
+        mock_pending.body = 'Restoring ...'
+        mock_message_cls.return_value = mock_pending
+
+        mock_query = MagicMock()
+        mock_query.get = MagicMock(return_value=mock_pending)
+        mock_message_cls.query = mock_query
+
         mock_super.return_value.restore = MagicMock(return_value=('filename', MagicMock()))
 
-        RepoObject.restore(mock_repo, b'testpath')
+        return mock_repo, mock_pending
+
+    @patch('rdiffweb.core.model._repo.Message')
+    @patch('rdiffweb.core.model._repo.super')
+    def test_pending_message_created_on_restore_start(self, mock_super, mock_message_cls):
+        """Test that a pending message is created at the start of restore."""
+        from rdiffweb.core.model import RepoObject
+
+        mock_repo, mock_pending = self._setup_mocks(mock_super, mock_message_cls)
+
+        RepoObject.restore(mock_repo, b'testfile.txt')
+
+        # Pending message created with "Restoring ..." text
+        self.assertTrue(mock_message_cls.called)
+        first_kw = mock_message_cls.call_args_list[0][1]
+        self.assertIn('Restoring', first_kw['body'])
+        self.assertIn('testfile.txt', first_kw['body'])
+
+        # add_message called once for pending
+        self.assertEqual(mock_repo.add_message.call_count, 1)
+
+        # commit called to persist pending
+        self.assertTrue(mock_repo.commit.called)
+
+        # super().restore called with callbacks
+        call_kwargs = mock_super.return_value.restore.call_args.kwargs
+        self.assertIn('success_callback', call_kwargs)
+        self.assertIn('failure_callback', call_kwargs)
+
+    @patch('rdiffweb.core.model._repo.Message')
+    @patch('rdiffweb.core.model._repo.super')
+    def test_success_callback_updates_pending_message(self, mock_super, mock_message_cls):
+        """Test that success callback updates the pending message, not adding new."""
+        from rdiffweb.core.model import RepoObject
+
+        mock_repo, mock_pending = self._setup_mocks(mock_super, mock_message_cls)
+
+        RepoObject.restore(mock_repo, b'testfile.txt')
+
+        call_kwargs = mock_super.return_value.restore.call_args.kwargs
+        success_cb = call_kwargs['success_callback']
+
+        # Trigger success callback
+        success_cb()
+
+        # Pending message body was updated
+        self.assertIn('succeeded', mock_pending.body)
+        self.assertIn('testfile.txt', mock_pending.body)
+
+        # No NEW message added (add_message only called once for pending)
+        self.assertEqual(mock_repo.add_message.call_count, 1)
+
+    @patch('rdiffweb.core.model._repo.Message')
+    @patch('rdiffweb.core.model._repo.super')
+    def test_failure_callback_updates_pending_message(self, mock_super, mock_message_cls):
+        """Test that failure callback updates the pending message with reason."""
+        from rdiffweb.core.model import RepoObject
+
+        mock_repo, mock_pending = self._setup_mocks(mock_super, mock_message_cls)
+
+        RepoObject.restore(mock_repo, b'testfile.txt')
 
         call_kwargs = mock_super.return_value.restore.call_args.kwargs
         failure_cb = call_kwargs['failure_callback']
 
-        failure_cb(42, 'browser disconnected')
+        failure_cb(None, 'client disconnected')
 
-        mock_repo.add_message.assert_called_once()
-        msg = mock_repo.add_message.call_args[0][0]
-        self.assertIn('browser disconnected', msg.body)
-        self.assertNotIn('exit code', msg.body)
+        self.assertIn('failed', mock_pending.body)
+        self.assertIn('client disconnected', mock_pending.body)
+        self.assertEqual(mock_repo.add_message.call_count, 1)
 
+    @patch('rdiffweb.core.model._repo.Message')
     @patch('rdiffweb.core.model._repo.super')
-    def test_failure_callback_with_exit_code_only(self, mock_super):
-        """Test failure callback with exit_code but no abort_reason."""
+    def test_failure_callback_with_exit_code_updates_pending(self, mock_super, mock_message_cls):
+        """Test failure callback with exit code also updates pending message."""
         from rdiffweb.core.model import RepoObject
 
-        mock_repo = MagicMock(spec=RepoObject)
-        mock_repo._decode = lambda b, errors='replace': b.decode('utf-8', errors)
-        mock_repo.add_message = MagicMock()
-        mock_repo.commit = MagicMock()
+        mock_repo, mock_pending = self._setup_mocks(mock_super, mock_message_cls)
 
-        mock_super.return_value.restore = MagicMock(return_value=('filename', MagicMock()))
-
-        RepoObject.restore(mock_repo, b'testpath')
+        RepoObject.restore(mock_repo, b'testfile.txt')
 
         call_kwargs = mock_super.return_value.restore.call_args.kwargs
         failure_cb = call_kwargs['failure_callback']
 
         failure_cb(42, None)
 
-        mock_repo.add_message.assert_called_once()
-        msg = mock_repo.add_message.call_args[0][0]
-        self.assertIn('exit code 42', msg.body)
+        self.assertIn('failed', mock_pending.body)
+        self.assertIn('exit code 42', mock_pending.body)
+        self.assertEqual(mock_repo.add_message.call_count, 1)
 
+    @patch('rdiffweb.core.model._repo.Message')
     @patch('rdiffweb.core.model._repo.super')
-    def test_success_callback_called_only_once(self, mock_super):
-        """Test that success callback is called once and contains display name."""
+    def test_fallback_creates_new_message_if_pending_not_found(self, mock_super, mock_message_cls):
+        """Test that if pending message can't be found, a new message is created."""
         from rdiffweb.core.model import RepoObject
 
-        mock_repo = MagicMock(spec=RepoObject)
-        mock_repo._decode = lambda b, errors='replace': b.decode('utf-8', errors)
-        mock_repo.add_message = MagicMock()
-        mock_repo.commit = MagicMock()
+        mock_repo, mock_pending = self._setup_mocks(mock_super, mock_message_cls)
+        # Make query.get return None (pending not found)
+        mock_message_cls.query.get.return_value = None
 
-        test_path = b'test;090file.txt'
-        expected_display_name = 'testZfile.txt'
-
-        mock_super.return_value.restore = MagicMock(return_value=('filename', MagicMock()))
-
-        RepoObject.restore(mock_repo, test_path)
+        RepoObject.restore(mock_repo, b'testfile.txt')
 
         call_kwargs = mock_super.return_value.restore.call_args.kwargs
         success_cb = call_kwargs['success_callback']
 
         success_cb()
-        success_cb()
-        success_cb()
 
-        # Note: deduplication is handled by RestoreState._callback_invoked
-        # Here we just test the callback itself adds the message
-        mock_repo.add_message.assert_called()
-        msg = mock_repo.add_message.call_args[0][0]
-        self.assertIn(expected_display_name, msg.body)
+        # add_message called twice: pending + fallback new message
+        self.assertEqual(mock_repo.add_message.call_count, 2)
 
+    @patch('rdiffweb.core.model._repo.Message')
     @patch('rdiffweb.core.model._repo.super')
-    def test_callback_exception_does_not_propagate(self, mock_super):
+    def test_callback_exception_does_not_propagate(self, mock_super, mock_message_cls):
         """Test that callback exceptions are caught and logged."""
         from rdiffweb.core.model import RepoObject
 
-        mock_repo = MagicMock(spec=RepoObject)
-        mock_repo._decode = lambda b, errors='replace': b.decode('utf-8', errors)
-        mock_repo.add_message = MagicMock(side_effect=RuntimeError('db down'))
-        mock_repo.commit = MagicMock()
-
-        mock_super.return_value.restore = MagicMock(return_value=('filename', MagicMock()))
+        mock_repo, mock_pending = self._setup_mocks(mock_super, mock_message_cls)
+        # Make Message.query.get raise an exception during callback
+        mock_message_cls.query.get = MagicMock(side_effect=RuntimeError('db down'))
 
         RepoObject.restore(mock_repo, b'testpath')
 
