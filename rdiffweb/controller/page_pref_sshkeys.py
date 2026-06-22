@@ -147,6 +147,7 @@ class PagePrefSshKeys:
 @cherrypy.expose
 @cherrypy.tools.json_out()
 class ApiSshKeys:
+    @cherrypy.tools.required_scope(scope='all,read_user')
     def list(self):
         """
         List current user keys
@@ -168,6 +169,7 @@ class ApiSshKeys:
         currentuser = cherrypy.serving.request.currentuser
         return [{'title': key.comment, 'fingerprint': key.fingerprint} for key in currentuser.authorizedkeys]
 
+    @cherrypy.tools.required_scope(scope='all,read_user')
     def get(self, fingerprint):
         """
         Return SSH key for given fingerprint

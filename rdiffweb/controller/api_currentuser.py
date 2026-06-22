@@ -78,12 +78,13 @@ class CurrentUserForm(DbForm):
 
 
 @cherrypy.expose
-@cherrypy.tools.required_scope(scope='all,read_user,write_user')
 class ApiCurrentUser:
+    ROLES_MAP = {v: k for k, v in UserObject.ROLES.items()}
     sshkeys = ApiSshKeys()
     tokens = ApiTokens()
     repos = ApiRepos()
 
+    @cherrypy.tools.required_scope(scope='all,read_user')
     def get(self):
         """
         Returns information about the current user, including user settings and a list of repositories.
@@ -139,11 +140,12 @@ class ApiCurrentUser:
             "disk_usage": u.disk_usage,
             "disk_quota": u.disk_quota,
             "lang": u.lang,
-            "mfa": u.lang,
-            "role": u.role,
+            "mfa": u.mfa,
+            "role": self.ROLES_MAP.get(u.role, None),
             "report_time_range": u.report_time_range,
             "repos": [
                 {
+                    "id": repo_obj.id,
                     # Database fields.
                     "name": repo_obj.name,
                     "maxage": repo_obj.maxage,

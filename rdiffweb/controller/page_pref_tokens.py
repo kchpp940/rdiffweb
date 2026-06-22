@@ -69,7 +69,7 @@ class ScopeField(SelectMultipleField):
                         _('Admin read all user settings - Grant read access to all users data.'),
                     ),
                     (
-                        'admin_write_user',
+                        'admin_write_users',
                         _('Admin write all user settings - Grant write access to all users data.'),
                     ),
                 ]
@@ -195,6 +195,7 @@ class ApiTokens:
 
     def _to_json(self, token):
         return {
+            'name': token.name,
             'title': token.name,
             'access_time': token.access_time,
             'creation_time': token.creation_time,
@@ -202,6 +203,7 @@ class ApiTokens:
             'scope': token.scope,
         }
 
+    @cherrypy.tools.required_scope(scope='all,read_user')
     def list(self):
         """
         Return list of current user access token
@@ -212,23 +214,26 @@ class ApiTokens:
 
         ```json
         [
-            {"title": "<h1>hold</h1>", "access_time": null, "creation_time": "2023-11-09T04:31:18Z", "expiration_time": null},
-            {"title": "test2", "access_time": "2024-01-30T17:59:08Z", "creation_time": "2024-01-30T17:57:51Z", "expiration_time": null}
+            {"name": "test", "title": "test", "access_time": null, "creation_time": "2023-11-09T04:31:18Z", "expiration_time": null},
+            {"name": "test2", "title": "test2", "access_time": "2024-01-30T17:59:08Z", "creation_time": "2024-01-30T17:57:51Z", "expiration_time": null}
         ]
         ```
 
         **Fields in JSON Payload**
 
-        - `title`: The title or name of the access token.
+        - `name`: The name of the access token (primary identifier).
+        - `title`: The title or name of the access token (alias for name).
         - `access_time`: The time of the last access using the token (null if never used).
         - `creation_time`: The creation time of the access token.
         - `expiration_time`: The time when the access token expires (null if never expires).
+        - `scope`: The list of scopes granted to this token.
 
         """
         currentuser = cherrypy.serving.request.currentuser
         tokens = Token.query.filter(Token.userid == currentuser.id).all()
         return [self._to_json(token) for token in tokens]
 
+    @cherrypy.tools.required_scope(scope='all,read_user')
     def get(self, name):
         """
         Return a specific access token info
@@ -238,7 +243,7 @@ class ApiTokens:
         **Example Response**
 
         ```json
-        {"title": "test2", "access_time": "2024-01-30T17:59:08Z", "creation_time": "2024-01-30T17:57:51Z", "expiration_time": null}
+        {"name": "test2", "title": "test2", "access_time": "2024-01-30T17:59:08Z", "creation_time": "2024-01-30T17:57:51Z", "expiration_time": null}
         ```
         """
         token = self._query(name)
@@ -249,7 +254,7 @@ class ApiTokens:
         """
         Delete a specific access token.
 
-        Revokes the access token identified by `<title>`.
+        Revokes the access token identified by `<name>`.
 
         Returns status 200 OK on success.
         """

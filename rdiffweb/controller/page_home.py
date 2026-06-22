@@ -66,59 +66,11 @@ class HomePage:
         eligible_repos = [r for r in repo_objs if r.last_backup_date and r.status[0] in ['ok', 'in_progress']]
         last_backup = min(eligible_repos, key=lambda r: r.last_backup_date) if eligible_repos else None
 
-        # Get disk usage for each repo using the shared active_filter logic.
-        # For each DiskUsage row, we use correlated subqueries to determine if
-        # it belongs to an active scan for its repo — exactly the same logic
-        # as DiskUsage.active_filter(), but computed per-row for all repos at
-        # once.  This guarantees page_home sees the same active data as listdir
-        # and any other caller.
-        from rdiffweb.core.model._diskusage import RepoDiskUsageScan as _RDUS
-        from sqlalchemy import and_, or_, select as _sa_select, func as _sa_func
-
-        # Per-row correlated subqueries keyed on DiskUsage.repoid
-        def _latest_id(du):
-            return (
-                _sa_select(_RDUS.id)
-                .where(
-                    _RDUS.repoid == du.repoid,
-                    _RDUS.status == _RDUS.STATUS_COMPLETED,
-                )
-                .order_by(_RDUS.id.desc())
-                .limit(1)
-                .scalar_subquery()
-            )
-
-        def _latest_count(du):
-            lid = _latest_id(du)
-            return (
-                _sa_select(_sa_func.count())
-                .where(
-                    DiskUsage.repoid == du.repoid,
-                    DiskUsage.scan_id == lid,
-                )
-                .scalar_subquery()
-            )
-
+        # Get disk usage
         disk_usage = (
             DiskUsage.query.with_entities(DiskUsage.repoid, DiskUsage.mirror_size, DiskUsage.increments_size)
             .join(DiskUsage.repo)
-            .filter(RepoObject.userid == userobj.id)
-            .filter(DiskUsage.logical_path == b'.')
-            .filter(
-                or_(
-                    # Case A: latest completed scan has data → only those rows
-                    and_(
-                        _latest_id(DiskUsage).isnot(None),
-                        _latest_count(DiskUsage) > 0,
-                        DiskUsage.scan_id == _latest_id(DiskUsage),
-                    ),
-                    # Case B: no usable completed scan → show all rows
-                    or_(
-                        _latest_id(DiskUsage).is_(None),
-                        _latest_count(DiskUsage) == 0,
-                    ),
-                )
-            )
+            .filter(DiskUsage.logical_path == b'.', RepoObject.userid == userobj.id)
             .all()
         )
         for repo in repo_objs:

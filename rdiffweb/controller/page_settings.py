@@ -335,7 +335,6 @@ class SettingsPage:
 
 
 @cherrypy.expose
-@cherrypy.tools.required_scope(scope='all,read_user,write_user')
 class ApiRepos:
     def _query(self, name_or_repoid):
         u = cherrypy.serving.request.currentuser
@@ -361,6 +360,7 @@ class ApiRepos:
             "encoding": repo_obj.encoding,
         }
 
+    @cherrypy.tools.required_scope(scope='all,read_user')
     def list(self):
         """
         Return current user repositories
@@ -372,6 +372,7 @@ class ApiRepos:
             u.commit()
         return [self._to_json(repo_obj) for repo_obj in u.repo_objs]
 
+    @cherrypy.tools.required_scope(scope='all,read_user')
     def get(self, name_or_repoid):
         """
         Return repository settings for the given id or name

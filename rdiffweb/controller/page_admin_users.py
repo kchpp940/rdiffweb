@@ -550,7 +550,6 @@ class AdminUsersPage:
 
 @cherrypy.expose
 @cherrypy.tools.is_admin()
-@cherrypy.tools.required_scope(scope='all,admin_read_users')
 class AdminApiUsers:
     ROLES_MAP = {v: k for k, v in UserObject.ROLES.items()}
 
@@ -574,6 +573,7 @@ class AdminApiUsers:
                     "disk_usage_threshold": user_obj.disk_usage_threshold,
                     "repos": [
                         {
+                            "id": repo_obj.id,
                             # database fields.
                             "name": repo_obj.name,
                             "maxage": repo_obj.maxage,
@@ -591,6 +591,7 @@ class AdminApiUsers:
             )
         return data
 
+    @cherrypy.tools.required_scope(scope='all,admin_read_users')
     def list(self):
         """
         List all users.
@@ -638,6 +639,7 @@ class AdminApiUsers:
         """
         return [self._to_json(user_obj) for user_obj in UserObject.query.all()]
 
+    @cherrypy.tools.required_scope(scope='all,admin_read_users')
     def get(self, username_or_id):
         """
         Return specific user information for the given id or username.

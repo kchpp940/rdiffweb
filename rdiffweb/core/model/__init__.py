@@ -17,7 +17,7 @@
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
-from ._diskusage import DiskUsage, RepoDiskUsageScan  # noqa
+from ._diskusage import DiskUsage  # noqa
 from ._message import Message  # noqa
 from ._repo import RepoObject  # noqa
 from ._session import SessionObject  # noqa

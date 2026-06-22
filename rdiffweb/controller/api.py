@@ -29,30 +29,62 @@ logger = logging.getLogger(__name__)
 def _checkpassword(realm, username, password):
     """
     Check basic authentication.
+
+    Unified authentication path for API:
+    1. First tries access token validation (checks expiration, updates access_time, applies token scope)
+    2. If MFA is enabled for user, rejects password-based auth via API
+    3. Falls back to standard username/password validation (grants 'all' scope)
+    4. On any failure, increments rate limit counter
     """
     # Validate username
     userobj = UserObject.get_user(username)
     if userobj is not None:
-        # Verify if the password matches a token.
+        # Path 1: Verify if the password matches a token.
+        # validate_access_token() internally checks for expiration.
         access_token = userobj.validate_access_token(password)
         if access_token:
+            # Update token access timestamp
             access_token.accessed()
             access_token.commit()
             cherrypy.serving.request.scope = access_token.scope
             return True
-        # Disable password authentication for MFA
+        # Path 2: Disable password authentication for MFA-enabled users on API.
+        # (MFA flow requires UI interaction, which is not available via Basic Auth)
         if userobj.mfa == UserObject.ENABLED_MFA:
             cherrypy.tools.ratelimit.increase_hit()
             return False
-    # Otherwise validate username password
+    # Path 3: Standard username/password validation.
+    # On success, this user gets 'all' scope (equivalent to full interactive session).
     valid = cherrypy.tools.auth.login_with_credentials(username, password)
     if valid:
-        # Store scope
         cherrypy.serving.request.scope = ['all']
         return True
-    # When invalid, we need to increase the rate limit.
+    # Path 4: Invalid credentials.
     cherrypy.tools.ratelimit.increase_hit()
     return False
+
+
+def _ensure_api_scope():
+    """
+    Post-authentication hook to guarantee scope is set on the request.
+
+    Covers the case where a user authenticates via session (UI login) and then
+    makes an API call. The auth_basic path in _checkpassword() sets scope,
+    but session-based auth does not. This tool ensures any authenticated
+    request has proper scope defaulting to ['all'] for interactive sessions.
+
+    Priority is 75 to run after auth_basic (70) and auth (72) but before
+    required_scope (85).
+    """
+    if not hasattr(cherrypy.serving.request, 'scope') or not cherrypy.serving.request.scope:
+        # Session-authenticated users get full scope since they passed
+        # the complete interactive auth flow (including MFA if enabled).
+        if getattr(cherrypy.serving.request, 'login', False):
+            cherrypy.serving.request.scope = ['all']
+
+
+# Register the scope-sync tool. Priority 75 = after auth, before required_scope.
+cherrypy.tools.ensure_api_scope = cherrypy.Tool('before_handler', _ensure_api_scope, priority=75)
 
 
 @cherrypy.expose
@@ -61,6 +93,7 @@ def _checkpassword(realm, username, password):
 @cherrypy.tools.json_in(on=True, force=False)
 @cherrypy.tools.auth_basic(realm='rdiffweb', checkpassword=_checkpassword, priority=70)
 @cherrypy.tools.auth(on=True, redirect=False)
+@cherrypy.tools.ensure_api_scope()
 @cherrypy.tools.auth_mfa(on=False)
 @cherrypy.tools.i18n(on=False)
 @cherrypy.tools.ratelimit(scope='rdiffweb-api', hit=0, debug=1, priority=69)
