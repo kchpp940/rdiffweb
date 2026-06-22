@@ -15,15 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import codecs
 import encodings
-import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import cherrypy
-
-logger = logging.getLogger(__name__)
 from cherrypy_foundation.tools.i18n import ugettext as _
 from sqlalchemy import Column, ForeignKey, Integer, SmallInteger, String
 from sqlalchemy import __version__ as sqlalchemy_version
@@ -295,67 +292,12 @@ class RepoObject(MessageMixin, Base, RdiffRepo):
         return super().delete()
 
     def restore(self, path, *args, **kwargs):
+        # Log activity
         display_name = self._decode(unquote(path))
-
-        pending_msg = Message(
-            body=_("Restoring file path %s...") % display_name,
-            type=Message.TYPE_EVENT,
-        )
-        self.add_message(pending_msg)
+        self.add_message(Message(body=_("Restore file path %s") % display_name, type=Message.TYPE_EVENT))
         self.commit()
-        pending_id = pending_msg.id
-
-        def _update_message(new_body):
-            try:
-                msg = Message.query.get(pending_id)
-            except Exception:
-                msg = None
-            if msg is None:
-                try:
-                    self.add_message(Message(body=new_body, type=Message.TYPE_EVENT))
-                    self.commit()
-                except Exception:
-                    logger.exception('failed to log restore event (fallback)')
-                return
-            try:
-                msg.body = new_body
-                self.commit()
-            except Exception:
-                logger.exception('failed to update restore event')
-
-        def success_callback():
-            try:
-                _update_message(
-                    _("Restore file path %s succeeded") % display_name
-                )
-            except Exception:
-                logger.exception('failed to log restore success event')
-
-        def failure_callback(exit_code, abort_reason=None):
-            try:
-                if abort_reason:
-                    msg = _("Restore file path %(path)s failed: %(reason)s") % {
-                        'path': display_name,
-                        'reason': abort_reason,
-                    }
-                elif exit_code is not None:
-                    msg = _("Restore file path %(path)s failed with exit code %(code)s") % {
-                        'path': display_name,
-                        'code': exit_code,
-                    }
-                else:
-                    msg = _("Restore file path %(path)s failed") % {'path': display_name}
-                _update_message(msg)
-            except Exception:
-                logger.exception('failed to log restore failure event')
-
-        return super().restore(
-            path,
-            *args,
-            success_callback=success_callback,
-            failure_callback=failure_callback,
-            **kwargs,
-        )
+        #
+        return super().restore(path, *args, **kwargs)
 
     @validates('maxage')
     def validate_maxage(self, key, value):

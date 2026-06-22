@@ -101,16 +101,12 @@ def unquote(name):
     # This function just gives back the original text if it can decode it
     def unquoted_char(match):
         """For each ;000 return the corresponding byte."""
-        # ;090 is 4 chars: semicolon + 3 digits
         if len(match.group()) != 4:
-            return match.group()
+            return match.group
         try:
-            val = int(match.group()[1:])
-            if val > 255:
-                return match.group()
-            return bytes([val])
+            return bytes([int(match.group()[1:])])
         except ValueError:
-            return match.group()
+            return match.group
 
     # Remove quote using regex
     return re.sub(pattern=b";[0-9]{3}", repl=unquoted_char, string=name, flags=re.S)
@@ -1085,68 +1081,33 @@ class RdiffRepo(object):
         if retcode not in [0, 2]:
             raise CalledProcessError(retcode, cmdline)
 
-    def restore(self, path, restore_as_of, kind=None, success_callback=None, failure_callback=None):
+    def restore(self, path, restore_as_of, kind=None):
         """
         Restore the current directory entry into a fileobj containing the
         file content of the directory compressed into an archive.
 
         `kind` must be one of the supported archive type or none to use `zip` for folder and `raw` for file.
 
-        `success_callback` will be called ONLY when BOTH:
-          1. All content has been transferred to the client
-          2. rdiff-backup process has exited with code 0
-
-        `failure_callback(exit_code, abort_reason)` will be called if the restore fails at any stage:
-          - Path validation fails
-          - Stream establishment fails
-          - Browser disconnects mid-transfer
-          - Archive creation fails
-          - rdiff-backup exits with non-zero code
-
         Return a filename and a fileobj.
         """
-        from rdiffweb.core.restore import RestoreState
-
         assert isinstance(path, bytes)
         assert restore_as_of, "restore_as_of must be defined"
         assert kind in ['tar', 'tar.bz2', 'tar.gz', 'tbz2', 'tgz', 'zip', 'raw', None]
 
-        restore_state = RestoreState(
-            success_callback=success_callback,
-            failure_callback=failure_callback,
-        )
-
-        try:
-            # Phase 1: Validate path using fstat (this also checks access permissions)
-            # This is the SAME security check for BOTH raw and archive downloads
-            path_obj = self.fstat(path)
-
-            # Define proper kind according to path type.
-            if path_obj.isdir:
-                if kind == 'raw':
-                    raise ValueError('raw type not supported for directory')
-                kind = kind or 'zip'
-            else:
-                kind = kind or 'raw'
-
-            # Define proper filename according to the path
+        # Define proper kind according to path type.
+        path_obj = self.fstat(path)
+        if path_obj.isdir:
             if kind == 'raw':
-                filename = path_obj.display_name
-            else:
-                filename = "%s.%s" % (path_obj.display_name, kind)
+                raise ValueError('raw type not supported for directory')
+            kind = kind or 'zip'
+        else:
+            kind = kind or 'raw'
 
-            # Build the full path to restore.
-            # path_obj.path may be quoted (e.g., ";090" for non-ASCII chars).
-            # rdiff-backup command line expects the logical (unquoted) path,
-            # as it handles quoted filenames on disk internally.
-            # unquote() is idempotent for already-unquoted paths.
-            full_path = os.path.join(self.full_path, unquote(path_obj.path))
-        except Exception as e:
-            restore_state.abort(str(e))
-            raise
-
-        # Phase 1 complete
-        restore_state.mark_path_validated()
+        # Define proper filename according to the path
+        if kind == 'raw':
+            filename = path_obj.display_name
+        else:
+            filename = "%s.%s" % (path_obj.display_name, kind)
 
         # Search full path location of rdiff-backup.
         rdiff_backup = find_rdiff_backup()
@@ -1163,12 +1124,11 @@ class RdiffRepo(object):
         # Execute the restore process and pipe the result.
         fileobj = pipe_restore(
             rdiff_backup,
-            path=full_path,
+            path=os.path.join(self.full_path, unquote(path_obj.path)),
             restore_as_of=restore_as_of,
             kind=kind,
             encoding=self._encoding.name,
             env=env,
-            restore_state=restore_state,
         )
 
         return filename, fileobj

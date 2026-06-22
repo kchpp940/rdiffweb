@@ -19,12 +19,12 @@ import os
 import shutil
 import subprocess
 import threading
-from datetime import datetime, timedelta, timezone
 
 import cherrypy
 from cherrypy.process.plugins import SimplePlugin
 
 from rdiffweb.core.model import DiskUsage, RepoObject
+from rdiffweb.core.model._diskusage import normalize_logical_path
 
 CONTEXT = 'DISKUSAGE'
 
@@ -34,6 +34,13 @@ class DiskUsagePlugin(SimplePlugin):
     Periodically scan backup storage and update disk usage for each repository
     using the `du` command-line tool. The scan is run with `nice` and `ionice`
     when available to reduce its impact on system resources.
+
+    Consistency guarantees:
+    - Each repository is scanned independently; a failure in one repo does not affect others.
+    - Results are collected in memory first and written atomically in a single transaction.
+    - Stale rows are removed implicitly by replacing all rows for a repo on success.
+    - Partial scans (du failure, mid-scan exception) never replace the existing data.
+    - A process-wide lock prevents concurrent scans from interleaving.
     """
 
     execution_time = '02:00'
@@ -51,7 +58,6 @@ class DiskUsagePlugin(SimplePlugin):
             return
         self.bus.log('Start DiskUsage plugin')
         self.bus.publish('scheduler:add_job_daily', self.execution_time, self._disk_usage_job)
-        # Start the background process if disk usage is empty.
         if DiskUsage.query.first() is None:
             self.bus.publish('scheduler:add_job_now', self._disk_usage_job)
 
@@ -63,9 +69,11 @@ class DiskUsagePlugin(SimplePlugin):
         self.stop()
         self.start()
 
-    def _scan_disk_usage(self, path):
+    def _run_du(self, path):
         """
-        Use `du` to scan all folder recursively to get the disk usage.
+        Run `du` on the given path and return a list of ``(size_bytes, subpath)`` tuples.
+
+        Raises ``RuntimeError`` if du fails (non-zero exit code) or cannot be started.
         """
         cmd = []
 
@@ -86,16 +94,16 @@ class DiskUsagePlugin(SimplePlugin):
                 stderr=subprocess.STDOUT,
             )
         except OSError as e:
-            cherrypy.log(f'failed to start du for path {path!r}: {e}', severity=logging.ERROR, context=CONTEXT)
-            return
+            raise RuntimeError(f'failed to start du for path {path!r}: {e}') from e
 
+        results = []
         for line in process.stdout:
             line = line.rstrip(b'\n')
             parts = line.split(b'\t', 1)
             if len(parts) == 2:
                 size_str, subpath = parts
                 try:
-                    yield int(size_str), subpath
+                    results.append((int(size_str), subpath))
                 except ValueError:
                     cherrypy.log(f'unexpected du output line {line!r}', severity=logging.WARNING, context=CONTEXT)
             else:
@@ -103,27 +111,45 @@ class DiskUsagePlugin(SimplePlugin):
 
         process.wait()
         if process.returncode != 0:
-            cherrypy.log(
-                f'du failed for path {path!r} (exit {process.returncode})', severity=logging.ERROR, context=CONTEXT
-            )
+            raise RuntimeError(f'du failed for path {path!r} (exit {process.returncode})')
 
-    def _update_disk_usage(self, repo_obj, logical_path, **kwargs):
-        with cherrypy.db.session.begin():
-            # Try to update first (most common case)
-            rows_updated = DiskUsage.query.filter_by(repoid=repo_obj.id, logical_path=logical_path).update(kwargs)
-            # If no row was updated, insert a new one
-            if not rows_updated:
-                DiskUsage(repoid=repo_obj.id, logical_path=logical_path, **kwargs).add()
+        return results
 
-    def _delete_disk_usage_older_than(self, repo_obj, cutoff: datetime):
-        with cherrypy.db.session.begin():
-            DiskUsage.query.filter(
-                DiskUsage.repoid == repo_obj.id,
-                DiskUsage.last_updated < cutoff,
-            ).delete()
+    def _collect_repo_usage(self, repo_obj):
+        """
+        Scan a single repository and return a dict keyed by normalized logical path
+        with ``(mirror_size, increments_size)`` tuples.
+
+        The entire repo scan either succeeds fully or raises an exception;
+        partial results are never returned.
+        """
+        repo_path = repo_obj.full_path
+        if not os.path.isdir(repo_path):
+            raise RuntimeError(f"repository folder doesn't exist: {repo_path!r}")
+
+        rdiff_data = os.path.join(repo_path, b'rdiff-backup-data')
+        increments_prefix = os.path.join(rdiff_data, b'increments')
+
+        raw_entries = self._run_du(repo_path)
+
+        usage = {}
+        for size, subpath in raw_entries:
+            if subpath.startswith(increments_prefix):
+                raw_rel = os.path.relpath(subpath, increments_prefix)
+                logical = normalize_logical_path(raw_rel)
+                mirror, incr = usage.get(logical, (None, None))
+                usage[logical] = (mirror, size)
+            elif subpath.startswith(rdiff_data):
+                continue
+            else:
+                raw_rel = os.path.relpath(subpath, repo_path)
+                logical = normalize_logical_path(raw_rel)
+                mirror, incr = usage.get(logical, (None, None))
+                usage[logical] = (size, incr)
+
+        return usage
 
     def _disk_usage_job(self):
-        # Skip execution if a scan is already running
         if not self._lock.acquire(blocking=False):
             cherrypy.log('disk usage scan already running, skipping', context=CONTEXT)
             return
@@ -136,51 +162,36 @@ class DiskUsagePlugin(SimplePlugin):
     def _run_disk_usage_scan(self):
         cherrypy.log('starting disk usage scan', context=CONTEXT)
 
-        # A race condition may occur.
         if cherrypy.db.session is None:
             return
 
-        # Make sure to start from a clean session.
         cherrypy.db.clear_sessions()
 
         with cherrypy.db.session.begin():
             repos = RepoObject.query.all()
             cherrypy.db.session.expunge_all()
 
-        # Loop on each repo
+        success_count = 0
+        fail_count = 0
+
         for repo_obj in repos:
             repo_path = repo_obj.full_path
-            if not os.path.isdir(repo_path):
-                cherrypy.log(f"skip disk usage for repository {repo_path!r} folder doesn't exists", context=CONTEXT)
-                continue
-            increments_prefix = os.path.join(repo_path, b'rdiff-backup-data', b'increments')
-            cherrypy.log(f'scanning disk usage for repository {repo_path!r}', context=CONTEXT)
-            scan_start = datetime.now(tz=timezone.utc) - timedelta(seconds=1)
             try:
-                # Scan files to get disk usage with "du"
-                for size, subpath in self._scan_disk_usage(repo_path):
-                    try:
-                        if subpath.startswith(increments_prefix):
-                            logical_path = os.path.relpath(subpath, increments_prefix)
-                            self._update_disk_usage(repo_obj, logical_path, increments_size=size)
-                        else:
-                            logical_path = os.path.relpath(subpath, repo_path)
-                            if logical_path.startswith(b'rdiff-backup-data'):
-                                continue
-                            self._update_disk_usage(repo_obj, logical_path, mirror_size=size)
-                    except Exception as e:
-                        cherrypy.log(
-                            f'failed to update disk usage for folder {subpath!r}: {e}',
-                            severity=logging.ERROR,
-                            traceback=True,
-                            context=CONTEXT,
-                        )
+                usage = self._collect_repo_usage(repo_obj)
 
-                # Delete stale rows not touched during this scan
-                self._delete_disk_usage_older_than(repo_obj, scan_start)
-                cherrypy.log(f'disk usage updated for repository {repo_path!r}', context=CONTEXT)
+                entries = [
+                    (logical_path, mirror_size, increments_size)
+                    for logical_path, (mirror_size, increments_size) in usage.items()
+                ]
+
+                with cherrypy.db.session.begin():
+                    DiskUsage.replace_all_for_repo(repo_obj.id, entries)
+
+                success_count += 1
+                cherrypy.log(f'disk usage updated for repository {repo_path!r} ({len(entries)} paths)', context=CONTEXT)
 
             except Exception as e:
+                fail_count += 1
                 cherrypy.log(
                     f'failed to update disk usage for repository {repo_path!r}: {e}',
                     severity=logging.ERROR,
@@ -190,7 +201,10 @@ class DiskUsagePlugin(SimplePlugin):
             finally:
                 cherrypy.db.session.rollback()
 
-        cherrypy.log('disk usage scan completed', context=CONTEXT)
+        cherrypy.log(
+            f'disk usage scan completed: {success_count} ok, {fail_count} failed',
+            context=CONTEXT,
+        )
 
 
 cherrypy.disk_usage = DiskUsagePlugin(cherrypy.engine)

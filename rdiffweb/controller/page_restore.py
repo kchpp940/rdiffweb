@@ -69,71 +69,29 @@ def _content_type(filename):
 class _file_generator(object):
     """
     Yield the given input (a file object) in chunks (default 64k).
-    Properly closes the underlying stream when iteration ends or is aborted.
-
-    Integrates with RestoreState via _wrap_close:
-      - Calls mark_transfer_complete() when all content is transferred
-      - Calls abort() on disconnection or exception before close
-      - After abort or transfer_complete, always calls close() to
-        reap the child process and finalize the state machine
     """
 
     def __init__(self, input, chunkSize=65536):
         self.input = input
         self.chunkSize = chunkSize
-        self._closed = False
-        self._transfer_complete = False
-        self._has_restore_state = hasattr(input, 'mark_transfer_complete') and hasattr(input, 'abort')
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self._closed:
+        chunk = self.input.read(self.chunkSize)
+        if chunk:
+            return chunk
+        else:
+            if hasattr(self.input, 'close'):
+                self.input.close()
             raise StopIteration()
-        try:
-            chunk = self.input.read(self.chunkSize)
-            if chunk:
-                return chunk
-            else:
-                if self._has_restore_state and not self._transfer_complete:
-                    self._transfer_complete = True
-                    try:
-                        self.input.mark_transfer_complete()
-                    except Exception:
-                        logger.exception('fail to mark transfer complete')
-                self.close()
-                raise StopIteration()
-        except StopIteration:
-            raise
-        except Exception as e:
-            if self._has_restore_state and not self._closed:
-                try:
-                    self.input.abort(f'client disconnected: {e}')
-                except Exception:
-                    logger.exception('fail to abort restore')
-            self.close()
-            raise
 
     next = __next__
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        if self._has_restore_state and not self._transfer_complete:
-            try:
-                self.input.abort('transfer aborted by client')
-            except Exception:
-                logger.exception('fail to abort restore on close')
         if hasattr(self.input, 'close'):
-            try:
-                self.input.close()
-            except Exception:
-                logger.exception('fail to close input stream')
-
-    def __del__(self):
-        self.close()
+            self.input.close()
 
 
 class RestorePage:
