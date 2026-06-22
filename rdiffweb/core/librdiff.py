@@ -1092,16 +1092,27 @@ class RdiffRepo(object):
 
         `kind` must be one of the supported archive type or none to use `zip` for folder and `raw` for file.
 
-        `success_callback` will be called when the restore stream is successfully established.
-        `failure_callback` will be called if the restore fails with exit code (or None for exceptions).
+        `success_callback` will be called ONLY when BOTH:
+          1. All content has been transferred to the client
+          2. rdiff-backup process has exited with code 0
+
+        `failure_callback(exit_code, abort_reason)` will be called if the restore fails at any stage:
+          - Path validation fails
+          - Stream establishment fails
+          - Browser disconnects mid-transfer
+          - Archive creation fails
+          - rdiff-backup exits with non-zero code
 
         Return a filename and a fileobj.
         """
+        from rdiffweb.core.restore import RestoreState
+
         assert isinstance(path, bytes)
         assert restore_as_of, "restore_as_of must be defined"
         assert kind in ['tar', 'tar.bz2', 'tar.gz', 'tbz2', 'tgz', 'zip', 'raw', None]
 
-        # Validate path using fstat (this also checks access permissions)
+        # Phase 1: Validate path using fstat (this also checks access permissions)
+        # This is the SAME security check for BOTH raw and archive downloads
         path_obj = self.fstat(path)
 
         # Define proper kind according to path type.
@@ -1137,6 +1148,13 @@ class RdiffRepo(object):
         if os.environ.get('TMPDIR'):
             env['TMPDIR'] = os.environ['TMPDIR']
 
+        # Create RestoreState and mark phase 1 complete
+        restore_state = RestoreState(
+            success_callback=success_callback,
+            failure_callback=failure_callback,
+        )
+        restore_state.mark_path_validated()
+
         # Execute the restore process and pipe the result.
         fileobj = pipe_restore(
             rdiff_backup,
@@ -1145,8 +1163,7 @@ class RdiffRepo(object):
             kind=kind,
             encoding=self._encoding.name,
             env=env,
-            success_callback=success_callback,
-            failure_callback=failure_callback,
+            restore_state=restore_state,
         )
 
         return filename, fileobj

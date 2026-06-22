@@ -299,7 +299,13 @@ class RepoObject(MessageMixin, Base, RdiffRepo):
         display_name = self._decode(unquote(path))
 
         def success_callback():
-            """Called only when restore stream is successfully established."""
+            """
+            Called ONLY when BOTH conditions are met:
+              1. All content has been transferred to the client
+              2. rdiff-backup process has exited with code 0
+
+            This ensures we never log "success" for interrupted downloads.
+            """
             try:
                 self.add_message(
                     Message(body=_("Restore file path %s") % display_name, type=Message.TYPE_EVENT)
@@ -308,10 +314,25 @@ class RepoObject(MessageMixin, Base, RdiffRepo):
             except Exception:
                 logger.exception('failed to log restore success event')
 
-        def failure_callback(exit_code):
-            """Called when restore fails."""
+        def failure_callback(exit_code, abort_reason=None):
+            """
+            Called when restore fails at any stage:
+              - Path validation failure
+              - Stream establishment failure (rdiff-backup didn't start)
+              - Browser disconnection during transfer
+              - Archive creation failure
+              - rdiff-backup non-zero exit code
+
+            exit_code: rdiff-backup exit code (or None if not available)
+            abort_reason: human-readable reason for the failure (or None)
+            """
             try:
-                if exit_code is not None:
+                if abort_reason:
+                    msg = _("Restore file path %(path)s failed: %(reason)s") % {
+                        'path': display_name,
+                        'reason': abort_reason,
+                    }
+                elif exit_code is not None:
                     msg = _("Restore file path %(path)s failed with exit code %(code)s") % {
                         'path': display_name,
                         'code': exit_code,
@@ -324,8 +345,8 @@ class RepoObject(MessageMixin, Base, RdiffRepo):
                 logger.exception('failed to log restore failure event')
 
         # Pass callbacks to the underlying restore implementation.
-        # Events will only be logged after the stream is successfully established
-        # or when a failure occurs, avoiding premature success logging.
+        # Events will only be logged after the transfer is complete AND
+        # the process exits successfully, or when a failure occurs at any stage.
         return super().restore(
             path,
             *args,
