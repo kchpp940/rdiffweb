@@ -132,7 +132,7 @@ class RawArchiver(object):
         if isinstance(self.dest, str):
             self.output = open(self.dest, 'wb')
         else:
-            self.outout = dest
+            self.output = dest
 
     def addfile(self, filename, arcname, encoding):
         assert isinstance(filename, bytes)
@@ -140,10 +140,10 @@ class RawArchiver(object):
         if os.path.isdir(filename):
             return
         with open(filename, 'rb') as f:
-            shutil.copyfileobj(f, self.outout)
+            shutil.copyfileobj(f, self.output)
 
     def close(self):
-        self.outout.close()
+        self.output.close()
 
 
 ARCHIVERS = {
@@ -160,27 +160,67 @@ ARCHIVERS = {
 class _wrap_close:
     """Wrap fileobject."""
 
-    def __init__(self, stream, pid):
+    def __init__(self, stream, pid, success_callback=None, failure_callback=None):
         assert isinstance(pid, int) and pid > 0
         self._stream = stream
         self._pid = pid
         self._return_code = None
+        self._success_callback = success_callback
+        self._failure_callback = failure_callback
+        self._closed = False
+        self._success = False
+
+    def set_success(self):
+        """Mark the restore operation as successfully started."""
+        self._success = True
+        if self._success_callback:
+            try:
+                self._success_callback()
+            except Exception:
+                logger.exception('success callback failed')
 
     def close(self):
-        self._stream.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._stream.close()
+        except Exception:
+            logger.exception('fail to close stream')
         if self._return_code is None:
             try:
+                try:
+                    os.kill(self._pid, 15)
+                except ProcessLookupError:
+                    pass
                 _pid, exit_status = os.waitpid(self._pid, 0)
                 self._return_code = exit_status >> 8
                 if self._return_code != 0:
                     logger.error(f'rdiff-backup restore return non-zero exit status: {self._return_code}')
+                    if self._failure_callback:
+                        try:
+                            self._failure_callback(self._return_code)
+                        except Exception:
+                            logger.exception('failure callback failed')
+                elif self._success and self._success_callback:
+                    try:
+                        self._success_callback()
+                    except Exception:
+                        logger.exception('success callback failed')
             except ChildProcessError:
                 logger.exception('fail to get child process exit status')
+            except Exception:
+                logger.exception('fail to wait for child process')
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None and self._failure_callback:
+            try:
+                self._failure_callback(None)
+            except Exception:
+                logger.exception('failure callback failed')
         self.close()
 
     def __getattr__(self, name):
@@ -233,7 +273,7 @@ def _yield_previous_lines(stream):
         yield previous_line
 
 
-def pipe_restore(rdiff_backup, path, restore_as_of, kind, encoding, env={}):
+def pipe_restore(rdiff_backup, path, restore_as_of, kind, encoding, env={}, success_callback=None, failure_callback=None):
     """
     Fork execution to restore and archive files in a separate process to woraround python Global Interpreter Lock.
 
@@ -244,6 +284,8 @@ def pipe_restore(rdiff_backup, path, restore_as_of, kind, encoding, env={}):
     restore_as_of: date to restore
     kind: type of archive to generate or raw to stream a single file.
     encoding: encoding of the repository (used to properly encode the filename in archive)
+    success_callback: called when restore stream is successfully established
+    failure_callback: called when restore fails with exit code (or None for exceptions)
     """
     assert rdiff_backup
     assert isinstance(path, bytes)
@@ -261,11 +303,25 @@ def pipe_restore(rdiff_backup, path, restore_as_of, kind, encoding, env={}):
         # Parent receive response header, then file body.
         # This could later be expended to transport more status information.
         fileobj = os.fdopen(rfile, 'rb')
-        # Expect "ok", then file content
-        header_status = fileobj.readline()
-        if header_status != b'ok\n':
-            raise RestoreException()
-        return _wrap_close(fileobj, pid)
+        wrapper = _wrap_close(fileobj, pid, success_callback=success_callback, failure_callback=failure_callback)
+        try:
+            # Expect "ok", then file content
+            header_status = fileobj.readline()
+            if header_status != b'ok\n':
+                error_msg = b''
+                try:
+                    error_msg = fileobj.readline().strip()
+                except Exception:
+                    pass
+                wrapper.close()
+                if error_msg:
+                    raise RestoreException(error_msg.decode('utf-8', 'replace'))
+                raise RestoreException('restore failed to start')
+            wrapper.set_success()
+            return wrapper
+        except Exception:
+            wrapper.close()
+            raise
 
     else:
         # Child - Close unused end
@@ -288,6 +344,13 @@ def pipe_restore(rdiff_backup, path, restore_as_of, kind, encoding, env={}):
             # propagate out of this function and cause exiting
             # with anything other than os._exit()
             logger.exception(f'restore failed: {e}')
+            try:
+                with os.fdopen(wfile, 'wb') as dest:
+                    dest.write(b'fail\n')
+                    dest.write(str(e).encode('utf-8', 'replace') + b'\n')
+                    dest.flush()
+            except Exception:
+                pass
             os._exit(CUST_EXIT_CODE)
 
 
@@ -312,14 +375,25 @@ def _restore(rdiff_backup, path, restore_as_of, kind, encoding, dest, env={}, se
     logger.debug('executing %r with env %r' % (cmd, env))
 
     archive = None
+    proc = None
+    header_sent = False
     try:
-        proc = subprocess.Popen(
-            cmd,
-            shell=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+            )
+        except Exception as e:
+            logger.error(f'fail to start rdiff-backup: {e}')
+            if send_header:
+                dest.write(b'fail\n')
+                dest.write(f'failed to start rdiff-backup: {e}'.encode('utf-8', 'replace') + b'\n')
+                dest.flush()
+            return CUST_EXIT_CODE
+
         for line in _yield_previous_lines(proc.stdout):
             logger.debug('rdiff-backup: %s' % line.decode('utf-8', 'replace'))
             # Since rdiff-backup 2.1.2b1 the line start with b'* '
@@ -342,6 +416,8 @@ def _restore(rdiff_backup, path, restore_as_of, kind, encoding, dest, env={}, se
                 # Send status header.
                 if archive is None and send_header:
                     dest.write(b'ok\n')
+                    dest.flush()
+                    header_sent = True
                 if archive is None:
                     # Then send archive.
                     archive = ARCHIVERS[kind](dest)
@@ -360,17 +436,50 @@ def _restore(rdiff_backup, path, restore_as_of, kind, encoding, dest, env={}, se
             except (OSError, ValueError):
                 pass
 
-        # return rdiff-backup restore exit-code
-        return proc.wait()
+        # Wait for rdiff-backup to complete and get exit code
+        return_code = proc.wait()
+        proc = None
+
+        # If no files were processed but we need to send header, send fail
+        if send_header and not header_sent:
+            if return_code == 0:
+                # For empty directories, still send ok
+                dest.write(b'ok\n')
+                dest.flush()
+                header_sent = True
+                archive = ARCHIVERS[kind](dest)
+            else:
+                dest.write(b'fail\n')
+                dest.write(f'rdiff-backup failed with exit code {return_code}'.encode('utf-8', 'replace') + b'\n')
+                dest.flush()
+
+        return return_code
     finally:
-        # Close the pipe
+        # Make sure to terminate the process if still running
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                logger.exception('fail to terminate rdiff-backup process')
+        # Close the archive
         if archive:
-            archive.close()
-        elif send_header:
-            dest.write(b'fail\n')
-            dest.flush()
+            try:
+                archive.close()
+            except Exception:
+                logger.exception('fail to close archive')
+        elif send_header and not header_sent:
+            try:
+                dest.write(b'fail\n')
+                dest.write(b'unexpected error during restore\n')
+                dest.flush()
+            except Exception:
+                pass
         # Clean-up the directory.
         if os.path.isdir(tmp_output):
             shutil.rmtree(tmp_output, ignore_errors=True)
         elif os.path.isfile(tmp_output):
-            os.remove(tmp_output)
+            try:
+                os.remove(tmp_output)
+            except Exception:
+                pass

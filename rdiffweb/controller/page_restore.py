@@ -69,29 +69,45 @@ def _content_type(filename):
 class _file_generator(object):
     """
     Yield the given input (a file object) in chunks (default 64k).
+    Properly closes the underlying stream when iteration ends or is aborted.
     """
 
     def __init__(self, input, chunkSize=65536):
         self.input = input
         self.chunkSize = chunkSize
+        self._closed = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        chunk = self.input.read(self.chunkSize)
-        if chunk:
-            return chunk
-        else:
-            if hasattr(self.input, 'close'):
-                self.input.close()
+        if self._closed:
             raise StopIteration()
+        try:
+            chunk = self.input.read(self.chunkSize)
+            if chunk:
+                return chunk
+            else:
+                self.close()
+                raise StopIteration()
+        except Exception:
+            self.close()
+            raise
 
     next = __next__
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         if hasattr(self.input, 'close'):
-            self.input.close()
+            try:
+                self.input.close()
+            except Exception:
+                logger.exception('fail to close input stream')
+
+    def __del__(self):
+        self.close()
 
 
 class RestorePage:

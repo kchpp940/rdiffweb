@@ -1081,12 +1081,15 @@ class RdiffRepo(object):
         if retcode not in [0, 2]:
             raise CalledProcessError(retcode, cmdline)
 
-    def restore(self, path, restore_as_of, kind=None):
+    def restore(self, path, restore_as_of, kind=None, success_callback=None, failure_callback=None):
         """
         Restore the current directory entry into a fileobj containing the
         file content of the directory compressed into an archive.
 
         `kind` must be one of the supported archive type or none to use `zip` for folder and `raw` for file.
+
+        `success_callback` will be called when the restore stream is successfully established.
+        `failure_callback` will be called if the restore fails with exit code (or None for exceptions).
 
         Return a filename and a fileobj.
         """
@@ -1094,8 +1097,10 @@ class RdiffRepo(object):
         assert restore_as_of, "restore_as_of must be defined"
         assert kind in ['tar', 'tar.bz2', 'tar.gz', 'tbz2', 'tgz', 'zip', 'raw', None]
 
-        # Define proper kind according to path type.
+        # Validate path using fstat (this also checks access permissions)
         path_obj = self.fstat(path)
+
+        # Define proper kind according to path type.
         if path_obj.isdir:
             if kind == 'raw':
                 raise ValueError('raw type not supported for directory')
@@ -1108,6 +1113,13 @@ class RdiffRepo(object):
             filename = path_obj.display_name
         else:
             filename = "%s.%s" % (path_obj.display_name, kind)
+
+        # Build the full path to restore.
+        # path_obj.path may be quoted (e.g., ";090" for non-ASCII chars).
+        # rdiff-backup command line expects the logical (unquoted) path,
+        # as it handles quoted filenames on disk internally.
+        # unquote() is idempotent for already-unquoted paths.
+        full_path = os.path.join(self.full_path, unquote(path_obj.path))
 
         # Search full path location of rdiff-backup.
         rdiff_backup = find_rdiff_backup()
@@ -1124,11 +1136,13 @@ class RdiffRepo(object):
         # Execute the restore process and pipe the result.
         fileobj = pipe_restore(
             rdiff_backup,
-            path=os.path.join(self.full_path, unquote(path_obj.path)),
+            path=full_path,
             restore_as_of=restore_as_of,
             kind=kind,
             encoding=self._encoding.name,
             env=env,
+            success_callback=success_callback,
+            failure_callback=failure_callback,
         )
 
         return filename, fileobj

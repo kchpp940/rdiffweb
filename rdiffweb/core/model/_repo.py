@@ -292,12 +292,44 @@ class RepoObject(MessageMixin, Base, RdiffRepo):
         return super().delete()
 
     def restore(self, path, *args, **kwargs):
-        # Log activity
+        # Prepare display name for logging
         display_name = self._decode(unquote(path))
-        self.add_message(Message(body=_("Restore file path %s") % display_name, type=Message.TYPE_EVENT))
-        self.commit()
-        #
-        return super().restore(path, *args, **kwargs)
+
+        def success_callback():
+            """Called only when restore stream is successfully established."""
+            try:
+                self.add_message(
+                    Message(body=_("Restore file path %s") % display_name, type=Message.TYPE_EVENT)
+                )
+                self.commit()
+            except Exception:
+                logger.exception('failed to log restore success event')
+
+        def failure_callback(exit_code):
+            """Called when restore fails."""
+            try:
+                if exit_code is not None:
+                    msg = _("Restore file path %(path)s failed with exit code %(code)s") % {
+                        'path': display_name,
+                        'code': exit_code,
+                    }
+                else:
+                    msg = _("Restore file path %(path)s failed") % {'path': display_name}
+                self.add_message(Message(body=msg, type=Message.TYPE_EVENT))
+                self.commit()
+            except Exception:
+                logger.exception('failed to log restore failure event')
+
+        # Pass callbacks to the underlying restore implementation.
+        # Events will only be logged after the stream is successfully established
+        # or when a failure occurs, avoiding premature success logging.
+        return super().restore(
+            path,
+            *args,
+            success_callback=success_callback,
+            failure_callback=failure_callback,
+            **kwargs,
+        )
 
     @validates('maxage')
     def validate_maxage(self, key, value):
