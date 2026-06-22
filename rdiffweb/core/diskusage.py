@@ -23,7 +23,7 @@ import threading
 import cherrypy
 from cherrypy.process.plugins import SimplePlugin
 
-from rdiffweb.core.model import DiskUsage, RepoObject
+from rdiffweb.core.model import DiskUsage, RepoDiskUsageScan, RepoObject
 from rdiffweb.core.model._diskusage import normalize_logical_path
 
 CONTEXT = 'DISKUSAGE'
@@ -35,20 +35,26 @@ class DiskUsagePlugin(SimplePlugin):
     using the `du` command-line tool. The scan is run with `nice` and `ionice`
     when available to reduce its impact on system resources.
 
-    Consistency guarantees:
-    - Each repository is scanned independently; a failure in one repo does not affect others.
-    - Results are collected in memory first and written atomically in a single transaction.
-    - Stale rows are removed implicitly by replacing all rows for a repo on success.
-    - Partial scans (du failure, mid-scan exception) never replace the existing data.
-    - A process-wide lock prevents concurrent scans from interleaving.
+    Two-phase commit with scan tokens:
+    1. Create a pending RepoDiskUsageScan record (transactional).
+    2. Run `du` outside any transaction (may be slow).
+    3. On success:
+       a. Verify no newer scan has already completed for this repo.
+       b. Insert all DiskUsage rows linked to the scan_id.
+       c. Mark the scan as completed.
+       d. Delete all older scans (and their DiskUsage rows) for this repo.
+    4. On failure: mark the scan as failed; existing data remains untouched.
+
+    Concurrency guarantees:
+    - Multiple scans can be pending for the same repo.
+    - Only the latest completed scan's data is retained.
+    - A scan that completes after a newer one is discarded automatically.
+    - Failed scans never modify or delete existing data.
     """
 
     execution_time = '02:00'
 
-    # `nice` CPU priority level (0-19, higher means lower priority)
     nice_level = 19
-
-    # `ionice` class: 1=realtime, 2=best-effort, 3=idle
     ionice_class = 3
 
     _lock = threading.Lock()
@@ -149,6 +155,63 @@ class DiskUsagePlugin(SimplePlugin):
 
         return usage
 
+    def _create_scan(self, repoid):
+        """Create a pending scan record and return its id."""
+        with cherrypy.db.session.begin():
+            scan = RepoDiskUsageScan.create_for_repo(repoid)
+            cherrypy.db.session.flush()
+            scan_id = scan.id
+        return scan_id
+
+    def _mark_scan_failed(self, scan_id, error_message):
+        """Mark a scan as failed; does not touch existing DiskUsage data."""
+        try:
+            with cherrypy.db.session.begin():
+                scan = RepoDiskUsageScan.query.filter_by(id=scan_id).one()
+                scan.mark_failed(error_message)
+        except Exception:
+            cherrypy.log(
+                f'failed to mark scan {scan_id} as failed',
+                severity=logging.ERROR,
+                traceback=True,
+                context=CONTEXT,
+            )
+
+    def _commit_scan(self, scan_id, repoid, usage):
+        """
+        Commit collected data for a scan.
+
+        First verifies that no newer scan has already been completed for this
+        repo. If a newer scan exists, this scan is marked as superseded (failed)
+        and its data is discarded.
+        """
+        entries = [
+            (logical_path, mirror_size, increments_size)
+            for logical_path, (mirror_size, increments_size) in usage.items()
+        ]
+
+        with cherrypy.db.session.begin():
+            scan = RepoDiskUsageScan.query.filter_by(id=scan_id).one()
+            if scan.status != RepoDiskUsageScan.STATUS_PENDING:
+                raise RuntimeError(f'scan {scan_id} is no longer pending (status={scan.status})')
+
+            latest = RepoDiskUsageScan.get_latest_completed(repoid)
+            if latest is not None and latest.id > scan_id:
+                scan.mark_failed(f'superseded by newer scan {latest.id}')
+                cherrypy.log(
+                    f'scan {scan_id} superseded by newer scan {latest.id} for repo {repoid}',
+                    context=CONTEXT,
+                )
+                return False
+
+            DiskUsage.replace_for_scan(scan_id, repoid, entries)
+
+            scan.mark_completed(len(entries))
+
+            DiskUsage.remove_old_scans_for_repo(repoid, keep_scan_id=scan_id)
+
+        return True
+
     def _disk_usage_job(self):
         if not self._lock.acquire(blocking=False):
             cherrypy.log('disk usage scan already running, skipping', context=CONTEXT)
@@ -173,27 +236,36 @@ class DiskUsagePlugin(SimplePlugin):
 
         success_count = 0
         fail_count = 0
+        superseded_count = 0
 
         for repo_obj in repos:
             repo_path = repo_obj.full_path
+            scan_id = None
             try:
+                scan_id = self._create_scan(repo_obj.id)
+                cherrypy.log(
+                    f'scan {scan_id} started for repository {repo_path!r}',
+                    context=CONTEXT,
+                )
+
                 usage = self._collect_repo_usage(repo_obj)
 
-                entries = [
-                    (logical_path, mirror_size, increments_size)
-                    for logical_path, (mirror_size, increments_size) in usage.items()
-                ]
-
-                with cherrypy.db.session.begin():
-                    DiskUsage.replace_all_for_repo(repo_obj.id, entries)
-
-                success_count += 1
-                cherrypy.log(f'disk usage updated for repository {repo_path!r} ({len(entries)} paths)', context=CONTEXT)
+                committed = self._commit_scan(scan_id, repo_obj.id, usage)
+                if committed:
+                    success_count += 1
+                    cherrypy.log(
+                        f'scan {scan_id} completed for repository {repo_path!r} ({len(usage)} paths)',
+                        context=CONTEXT,
+                    )
+                else:
+                    superseded_count += 1
 
             except Exception as e:
                 fail_count += 1
+                if scan_id is not None:
+                    self._mark_scan_failed(scan_id, str(e))
                 cherrypy.log(
-                    f'failed to update disk usage for repository {repo_path!r}: {e}',
+                    f'scan {scan_id} failed for repository {repo_path!r}: {e}',
                     severity=logging.ERROR,
                     traceback=True,
                     context=CONTEXT,
@@ -202,7 +274,7 @@ class DiskUsagePlugin(SimplePlugin):
                 cherrypy.db.session.rollback()
 
         cherrypy.log(
-            f'disk usage scan completed: {success_count} ok, {fail_count} failed',
+            f'disk usage scan completed: {success_count} ok, {fail_count} failed, {superseded_count} superseded',
             context=CONTEXT,
         )
 

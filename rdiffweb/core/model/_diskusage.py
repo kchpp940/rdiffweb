@@ -15,14 +15,16 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
+from datetime import datetime, timezone
 
 import cherrypy
 import cherrypy_foundation.plugins.db  # noqa
-from sqlalchemy import Column, ForeignKey, Index, Integer, LargeBinary
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, LargeBinary, SmallInteger, String, event, select
 from sqlalchemy.orm import relationship, validates
 from sqlalchemy.sql.functions import func
 
 from ._timestamp import Timestamp
+from ._update import column_add, column_exists, table_exists
 
 Base = cherrypy.db.base
 
@@ -46,6 +48,68 @@ def normalize_logical_path(path):
     return path
 
 
+class RepoDiskUsageScan(Base):
+    """
+    Tracks a single disk usage scan batch for a repository.
+
+    Each scan goes through:
+    pending → collecting data → completed (success) / failed (error)
+
+    DiskUsage rows are linked to a scan_id; only rows from the latest
+    completed scan for a repo are considered active.
+    """
+
+    __tablename__ = 'repodiskusagescans'
+    __table_args__ = (Index('repodiskusagescan_repoid_status_index', 'RepoID', 'Status'),)
+
+    STATUS_PENDING = 'pending'
+    STATUS_COMPLETED = 'completed'
+    STATUS_FAILED = 'failed'
+
+    id = Column('DiskUsageScanID', Integer, primary_key=True)
+    repoid = Column('RepoID', Integer, ForeignKey("repos.RepoID", ondelete="CASCADE"), nullable=False, index=True)
+    repo = relationship('RepoObject', lazy=True)
+    status = Column('Status', String(16), nullable=False, default=STATUS_PENDING, index=True)
+    started_at = Column('StartedAt', Timestamp, nullable=False, default=lambda: datetime.now(tz=timezone.utc))
+    completed_at = Column('CompletedAt', Timestamp, nullable=True)
+    total_paths = Column('TotalPaths', Integer, nullable=True)
+    error_message = Column('ErrorMessage', LargeBinary(length=8192), nullable=True)
+
+    disk_usages = relationship('DiskUsage', back_populates='scan', cascade='all, delete-orphan', lazy=True)
+
+    def mark_completed(self, total_paths):
+        self.status = self.STATUS_COMPLETED
+        self.completed_at = datetime.now(tz=timezone.utc)
+        self.total_paths = total_paths
+        self.error_message = None
+
+    def mark_failed(self, error_message):
+        self.status = self.STATUS_FAILED
+        self.completed_at = datetime.now(tz=timezone.utc)
+        if isinstance(error_message, str):
+            error_message = error_message.encode('utf-8', errors='surrogateescape')
+        self.error_message = error_message
+
+    @classmethod
+    def create_for_repo(cls, repoid):
+        """Create a new pending scan record for the given repo."""
+        scan = cls(repoid=repoid, status=cls.STATUS_PENDING)
+        scan.add()
+        return scan
+
+    @classmethod
+    def get_latest_completed(cls, repoid):
+        """Return the latest completed scan for a repo, or None."""
+        return (
+            cls.query.filter(cls.repoid == repoid, cls.status == cls.STATUS_COMPLETED)
+            .order_by(cls.id.desc())
+            .first()
+        )
+
+    def __repr__(self):
+        return f"RepoDiskUsageScan(id={self.id!r}, repoid={self.repoid!r}, status={self.status!r})"
+
+
 class DiskUsage(Base):
     __tablename__ = 'diskusages'
     __table_args__ = (Index('diskusage_parentpath_index', 'RepoID', 'ParentPath'),)
@@ -59,6 +123,14 @@ class DiskUsage(Base):
     mirror_size = Column('MirrorSize', Integer, nullable=True, server_default=None)
     increments_size = Column('IncrementsSize', Integer, nullable=True, server_default=None)
     last_updated = Column('LastUpdated', Timestamp, nullable=False, default=func.now(), onupdate=func.now())
+    scan_id = Column(
+        'DiskUsageScanID',
+        Integer,
+        ForeignKey("repodiskusagescans.DiskUsageScanID", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    scan = relationship('RepoDiskUsageScan', back_populates='disk_usages')
 
     @validates('logical_path')
     def _validate_logical_path(self, key, value):
@@ -70,23 +142,95 @@ class DiskUsage(Base):
         return value
 
     @classmethod
-    def replace_all_for_repo(cls, repoid, entries):
+    def replace_for_scan(cls, scan_id, repoid, entries):
         """
-        Atomically replace all DiskUsage rows for a repository.
+        Insert DiskUsage rows for a completed scan.
 
         ``entries`` is an iterable of ``(logical_path, mirror_size, increments_size)`` tuples.
 
-        This deletes all existing rows for the repo and inserts the new ones
-        in a single operation. Caller must be within an active transaction.
+        After insertion, callers should call :meth:`remove_old_scans_for_repo`
+        to prune rows from previous scans.
         """
-        cls.query.filter(cls.repoid == repoid).delete()
         for logical_path, mirror_size, increments_size in entries:
             cls(
                 repoid=repoid,
+                scan_id=scan_id,
                 logical_path=normalize_logical_path(logical_path),
                 mirror_size=mirror_size,
                 increments_size=increments_size,
             ).add()
 
+    @classmethod
+    def remove_old_scans_for_repo(cls, repoid, keep_scan_id):
+        """
+        Delete all DiskUsage rows and RepoDiskUsageScan records for ``repoid``
+        except those belonging to ``keep_scan_id``.
+
+        Also cleans up any orphaned pending scans older than the completed one.
+        """
+        from sqlalchemy import delete
+
+        delete_stmt = delete(RepoDiskUsageScan).where(
+            RepoDiskUsageScan.repoid == repoid,
+            RepoDiskUsageScan.id != keep_scan_id,
+        )
+        cherrypy.db.session.execute(delete_stmt)
+
     def __repr__(self):
         return f"DiskUsage({self.repoid!r}, {self.logical_path!r}, mirror_size={self.mirror_size!r}, increments_size={self.increments_size!r})"
+
+
+@event.listens_for(Base.metadata, 'after_create')
+def update_diskusage_schema(target, conn, **kw):
+    """
+    Schema migration for disk usage tables.
+
+    Runs after all tables are created to handle incremental schema changes
+    and data migrations for existing databases.
+    """
+    if not table_exists(conn, DiskUsage.__table__):
+        return
+
+    # Add scan_id column if missing (for existing databases)
+    if not column_exists(conn, DiskUsage.scan_id):
+        column_add(conn, DiskUsage.scan_id)
+
+    # Migrate legacy rows (without scan_id) by creating a synthetic scan record
+    if column_exists(conn, DiskUsage.scan_id):
+        legacy_count = conn.execute(
+            select(func.count()).where(DiskUsage.__table__.c.RepoID.isnot(None), DiskUsage.__table__.c.DiskUsageScanID.is_(None))
+        ).scalar()
+        if legacy_count and legacy_count > 0:
+            # Get distinct repoids with legacy data
+            legacy_repos = conn.execute(
+                select(DiskUsage.__table__.c.RepoID)
+                .where(DiskUsage.__table__.c.DiskUsageScanID.is_(None))
+                .distinct()
+            ).fetchall()
+
+            now = datetime.now(tz=timezone.utc)
+            for (repoid,) in legacy_repos:
+                # Create a synthetic completed scan
+                result = conn.execute(
+                    RepoDiskUsageScan.__table__.insert().values(
+                        RepoID=repoid,
+                        Status=RepoDiskUsageScan.STATUS_COMPLETED,
+                        StartedAt=now,
+                        CompletedAt=now,
+                        TotalPaths=conn.execute(
+                            select(func.count())
+                            .where(DiskUsage.__table__.c.RepoID == repoid)
+                            .where(DiskUsage.__table__.c.DiskUsageScanID.is_(None))
+                        ).scalar(),
+                        ErrorMessage=None,
+                    )
+                )
+                scan_id = result.inserted_primary_key[0]
+
+                # Update legacy rows to point to the synthetic scan
+                conn.execute(
+                    DiskUsage.__table__.update()
+                    .where(DiskUsage.__table__.c.RepoID == repoid)
+                    .where(DiskUsage.__table__.c.DiskUsageScanID.is_(None))
+                    .values(DiskUsageScanID=scan_id)
+                )
