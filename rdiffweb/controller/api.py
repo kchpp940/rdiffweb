@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import json
 import logging
 
 import cherrypy
@@ -87,6 +88,55 @@ def _ensure_api_scope():
 cherrypy.tools.ensure_api_scope = cherrypy.Tool('before_handler', _ensure_api_scope, priority=75)
 
 
+def _api_json_error():
+    """
+    Error response formatter for API endpoints.
+
+    Ensures all API errors (400, 401, 403, 404, 405, 500, etc.) are returned
+    as a consistent JSON structure instead of the default HTML error page.
+
+    Response format:
+        {
+            "code": 400,
+            "status": "400 Bad Request",
+            "message": "Detailed error description"
+        }
+    """
+    response = cherrypy.serving.response
+    request = cherrypy.serving.request
+
+    # Only apply to API paths
+    if not request.path_info.startswith('/api/'):
+        return
+
+    # Get error info from the request
+    error = getattr(request, 'error_page', None)
+    if error is None:
+        # Try to get from HTTPError
+        status = response.status
+        code = response.status_code
+        message = ''
+    else:
+        status = error.status
+        code = error.code
+        message = error.message or ''
+
+    # Build consistent error response
+    error_body = {
+        "code": code,
+        "status": status,
+        "message": message,
+    }
+
+    # Set response
+    response.headers['Content-Type'] = 'application/json'
+    response.body = json.dumps(error_body).encode('utf-8')
+
+
+# Register API error formatter. Priority 10 = early in the error response chain.
+cherrypy.tools.api_json_error = cherrypy.Tool('before_error_response', _api_json_error, priority=10)
+
+
 @cherrypy.expose
 @cherrypy.tools.allow(on=False)
 @cherrypy.tools.json_out(on=True)
@@ -94,6 +144,7 @@ cherrypy.tools.ensure_api_scope = cherrypy.Tool('before_handler', _ensure_api_sc
 @cherrypy.tools.auth_basic(realm='rdiffweb', checkpassword=_checkpassword, priority=70)
 @cherrypy.tools.auth(on=True, redirect=False)
 @cherrypy.tools.ensure_api_scope()
+@cherrypy.tools.api_json_error()
 @cherrypy.tools.auth_mfa(on=False)
 @cherrypy.tools.i18n(on=False)
 @cherrypy.tools.ratelimit(scope='rdiffweb-api', hit=0, debug=1, priority=69)

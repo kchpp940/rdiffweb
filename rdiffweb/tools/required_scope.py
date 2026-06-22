@@ -16,14 +16,32 @@
 import cherrypy
 
 
+# Canonical list of all supported scopes and their display names.
+# Used for validation, UI display, and OpenAPI generation.
+# IMPORTANT: Scopes are independent - there is NO implicit inheritance.
+# Read scopes grant read-only access; write scopes grant write-only access.
+# The 'all' scope is the exception and grants full access (password/session users).
+SCOPE_DEFS = {
+    'all': 'Everything - Full read and write access to all resources.',
+    'read_user': 'Read current user - Read access to your profile, repositories, ssh keys and access tokens. Read-only.',
+    'write_user': 'Write current user - Write access to your profile, repositories, ssh keys and access tokens. Does not include read access.',
+    'admin_read_users': 'Admin read users - Read access to all user data. Read-only.',
+    'admin_write_users': 'Admin write users - Create, update and delete all users. Does not include read access.',
+}
+
+
 def required_scope(scope):
     """
     Check the current authentication has the required scope to access the resource.
 
-    Supported scope hierarchy (implicit inclusion):
-      - 'all' implicitly includes all other scopes
-      - 'write_user' implicitly includes 'read_user'
-      - 'admin_write_users' implicitly includes 'admin_read_users'
+    Each endpoint must explicitly declare which scopes are allowed. There is NO
+    implicit scope inheritance (e.g. write_user does NOT grant read_user).
+    The 'all' scope is the only exception: it grants access to every endpoint
+    and is automatically assigned to password/session authenticated users.
+
+    Pattern:
+      - Read endpoints:  scope='all,read_user'  or  scope='all,admin_read_users'
+      - Write endpoints: scope='all,write_user' or  scope='all,admin_write_users'
     """
     # Convert single scope or scope list to array.
     if isinstance(scope, str):
@@ -33,21 +51,13 @@ def required_scope(scope):
     if not current_scope:
         raise cherrypy.HTTPError(403)
 
-    # Expand current scope with implicit permissions
-    expanded_scope = set(current_scope)
-    if 'all' in current_scope:
-        expanded_scope.update([
-            'read_user', 'write_user',
-            'admin_read_users', 'admin_write_users',
-        ])
-    if 'write_user' in current_scope:
-        expanded_scope.add('read_user')
-    if 'admin_write_users' in current_scope:
-        expanded_scope.add('admin_read_users')
-
-    # Check if our expanded current_scope match any of the required scope.
+    # Check if any of the required scopes matches the current scope.
+    # 'all' is a wildcard that matches every required scope.
+    current_scope_set = set(current_scope)
+    if 'all' in current_scope_set:
+        return True
     for s in scope:
-        if s in expanded_scope:
+        if s != 'all' and s in current_scope_set:
             return True
     raise cherrypy.HTTPError(403)
 

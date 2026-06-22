@@ -19,12 +19,112 @@ import textwrap
 
 import cherrypy
 
+from rdiffweb.tools.required_scope import SCOPE_DEFS
+
+
+# Map HTTP methods to their semantic operation type (read vs write)
+# Used for determining which scope applies when scope is defined at class level
+_READ_METHODS = {'get', 'list'}
+_WRITE_METHODS = {'post', 'put', 'delete'}
+
+
+def _extract_scopes_from_cp_config(cp_config, method):
+    """
+    Extract required scopes from a cherrypy config dict.
+
+    Returns a list of scope strings, or None if no scope requirement is found.
+    """
+    scope_str = cp_config.get('tools.required_scope.scope', None)
+    if scope_str is None:
+        return None
+    if isinstance(scope_str, str):
+        return [s.strip() for s in scope_str.split(',') if s.strip()]
+    if isinstance(scope_str, (list, tuple)):
+        return list(scope_str)
+    return None
+
 
 @cherrypy.expose
 class OpenAPI:
     """
     Return a Json listing all the available routes as OpenAPI format.
     """
+
+    _SECURITY_SCHEMES = {
+        "basicAuth": {
+            "type": "http",
+            "scheme": "basic",
+            "description": "Basic authentication with username and password (or access token as password).",
+        },
+        "accessToken": {
+            "type": "http",
+            "scheme": "basic",
+            "description": "Access token authentication. Use your access token as the password (username is ignored).",
+        },
+    }
+
+    _ERROR_RESPONSES = {
+        "400": {
+            "description": "Bad Request - Invalid input parameters",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "integer", "example": 400},
+                            "status": {"type": "string", "example": "400 Bad Request"},
+                            "message": {"type": "string", "example": "Invalid field: foo"},
+                        },
+                    }
+                }
+            },
+        },
+        "401": {
+            "description": "Unauthorized - Authentication required",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "integer", "example": 401},
+                            "status": {"type": "string", "example": "401 Unauthorized"},
+                            "message": {"type": "string", "example": ""},
+                        },
+                    }
+                }
+            },
+        },
+        "403": {
+            "description": "Forbidden - Insufficient scope or permissions",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "integer", "example": 403},
+                            "status": {"type": "string", "example": "403 Forbidden"},
+                            "message": {"type": "string", "example": ""},
+                        },
+                    }
+                }
+            },
+        },
+        "404": {
+            "description": "Not Found - Resource does not exist",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "integer", "example": 404},
+                            "status": {"type": "string", "example": "404 Not Found"},
+                            "message": {"type": "string", "example": ""},
+                        },
+                    }
+                }
+            },
+        },
+    }
 
     def _create_parameters(self, node, cp_config):
         """
@@ -117,6 +217,20 @@ class OpenAPI:
         if method == 'post' and is_json_in:
             method_object['requestBody'] = {'required': True, 'content': {'application/json': {}}}
 
+        # Add security scopes for API endpoints
+        scopes = _extract_scopes_from_cp_config(cp_config, method)
+        if scopes is not None:
+            # For OpenAPI security, we list the scopes required.
+            # We use both basicAuth and accessToken since both work.
+            method_object['security'] = [
+                {"basicAuth": scopes},
+                {"accessToken": scopes},
+            ]
+            # Add 401/403 error responses for authenticated endpoints
+            method_object['responses'].setdefault("401", self._ERROR_RESPONSES["401"])
+            method_object['responses'].setdefault("403", self._ERROR_RESPONSES["403"])
+            method_object['responses'].setdefault("400", self._ERROR_RESPONSES["400"])
+
         return method_object
 
     def _create_path_object_api(self, path, node, cp_config):
@@ -195,13 +309,38 @@ class OpenAPI:
             "openapi": "3.0.0",
             "info": {
                 "title": title,
-                "description": "Auto-generated OpenAPI documentation",
+                "description": (
+                    "rdiffweb REST API\n\n"
+                    "## Authentication\n\n"
+                    "The API supports two authentication methods:\n"
+                    "- **Basic Auth**: Use your username and password (session-based users get `all` scope).\n"
+                    "- **Access Token**: Use an access token as the password (username can be anything).\n"
+                    "  Tokens have a limited set of scopes that determine which endpoints are accessible.\n\n"
+                    "## Scopes\n\n"
+                    + "\n".join([f"- **{name}**: {desc}" for name, desc in SCOPE_DEFS.items()])
+                    + "\n\n## Error Responses\n\n"
+                    "All error responses follow the same JSON format:\n"
+                    "```json\n"
+                    "{\n"
+                    '  "code": 400,\n'
+                    '  "status": "400 Bad Request",\n'
+                    '  "message": "error description"\n'
+                    "}\n"
+                    "```"
+                ),
                 "version": version,
             },
             "servers": [
                 {
                     "url": cherrypy.url('/'),
                 }
+            ],
+            "components": {
+                "securitySchemes": self._SECURITY_SCHEMES,
+            },
+            "security": [
+                {"basicAuth": []},
+                {"accessToken": []},
             ],
             "paths": paths,
         }

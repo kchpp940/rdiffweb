@@ -44,17 +44,17 @@ class ScopeField(SelectMultipleField):
 
     def __init__(self, label=None, **kwargs):
         choices = [
-            ('all', _('Everything - Allow read write access to everything.')),
+            ('all', _('Everything - Full read and write access to all resources.')),
             (
                 'read_user',
                 _(
-                    'Read user settings - Grant read access to your profile, notification settings, ssh keys and access token.'
+                    'Read current user - Read access to your profile, repositories, ssh keys and access tokens. Read-only.'
                 ),
             ),
             (
                 'write_user',
                 _(
-                    'Write user settings - Grant write access to your profile, notification settings, ssh keys and access token.'
+                    'Write current user - Write access to your profile, repositories, ssh keys and access tokens. Does not include read access.'
                 ),
             ),
         ]
@@ -66,11 +66,11 @@ class ScopeField(SelectMultipleField):
                 [
                     (
                         'admin_read_users',
-                        _('Admin read all user settings - Grant read access to all users data.'),
+                        _('Admin read users - Read access to all user data. Read-only.'),
                     ),
                     (
                         'admin_write_users',
-                        _('Admin write all user settings - Grant write access to all users data.'),
+                        _('Admin write users - Create, update and delete all users. Does not include read access.'),
                     ),
                 ]
             )
