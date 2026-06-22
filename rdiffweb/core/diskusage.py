@@ -179,11 +179,18 @@ class DiskUsagePlugin(SimplePlugin):
 
     def _commit_scan(self, scan_id, repoid, usage):
         """
-        Commit collected data for a scan.
+        Commit collected data for a scan atomically.
 
-        First verifies that no newer scan has already been completed for this
-        repo. If a newer scan exists, this scan is marked as superseded (failed)
-        and its data is discarded.
+        Uses a row-level lock on the RepoObject row to guarantee that only
+        one pending scan can commit at a time for a given repository.
+
+        Within the lock:
+        - Re-checks that no newer completed scan exists.
+        - Inserts DiskUsage rows linked to this scan_id.
+        - Marks this scan as completed.
+        - Explicitly deletes data from older scans.
+
+        Returns True if the scan was committed, False if it was superseded.
         """
         entries = [
             (logical_path, mirror_size, increments_size)
@@ -191,6 +198,20 @@ class DiskUsagePlugin(SimplePlugin):
         ]
 
         with cherrypy.db.session.begin():
+            # Acquire a row lock on the RepoObject.  This serialises all
+            # commit-scan operations for the same repo, so two pending
+            # scans cannot both observe the same "latest completed" state
+            # and then race to write.  Works on SQLite (table-level) and
+            # PostgreSQL (row-level).
+            repo = (
+                RepoObject.query.filter(RepoObject.id == repoid)
+                .with_for_update()
+                .one_or_none()
+            )
+            if repo is None:
+                raise RuntimeError(f'repo {repoid} no longer exists during scan commit')
+
+            # Under the lock, re-read the latest completed scan.
             scan = RepoDiskUsageScan.query.filter_by(id=scan_id).one()
             if scan.status != RepoDiskUsageScan.STATUS_PENDING:
                 raise RuntimeError(f'scan {scan_id} is no longer pending (status={scan.status})')

@@ -66,11 +66,41 @@ class HomePage:
         eligible_repos = [r for r in repo_objs if r.last_backup_date and r.status[0] in ['ok', 'in_progress']]
         last_backup = min(eligible_repos, key=lambda r: r.last_backup_date) if eligible_repos else None
 
-        # Get disk usage
+        # Get disk usage for each repo using the latest completed scan.
+        # For each repo, rows are considered active when either:
+        #   (a) a completed scan exists and scan_id matches the latest, OR
+        #   (b) no completed scan exists (legacy data / migration in progress)
+        from rdiffweb.core.model._diskusage import RepoDiskUsageScan as _RDUS
+        from sqlalchemy import and_, or_, select as _sa_select, func as _sa_func
+
+        _latest_scan = (
+            _sa_select(_RDUS.id)
+            .where(
+                _RDUS.repoid == DiskUsage.repoid,
+                _RDUS.status == _RDUS.STATUS_COMPLETED,
+            )
+            .order_by(_RDUS.id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        _has_completed = (
+            _sa_select(_sa_func.count())
+            .where(
+                _RDUS.repoid == DiskUsage.repoid,
+                _RDUS.status == _RDUS.STATUS_COMPLETED,
+            )
+            .scalar_subquery()
+        )
         disk_usage = (
             DiskUsage.query.with_entities(DiskUsage.repoid, DiskUsage.mirror_size, DiskUsage.increments_size)
             .join(DiskUsage.repo)
             .filter(DiskUsage.logical_path == b'.', RepoObject.userid == userobj.id)
+            .filter(
+                or_(
+                    and_(_has_completed > 0, DiskUsage.scan_id == _latest_scan),
+                    _has_completed == 0,
+                )
+            )
             .all()
         )
         for repo in repo_objs:

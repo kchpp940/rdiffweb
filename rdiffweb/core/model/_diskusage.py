@@ -142,14 +142,87 @@ class DiskUsage(Base):
         return value
 
     @classmethod
+    def _active_scan_id_subquery(cls, repoid):
+        """
+        Return a scalar subquery that yields the ``scan_id`` considered
+        "active" for ``repoid``, or ``None`` if all rows should be treated
+        as active (legacy / migration-incomplete).
+
+        A scan_id is active when it belongs to the latest completed scan.
+        When no completed scan exists for the repo but there are legacy rows
+        (scan_id IS NULL), the subquery returns NULL, which callers should
+        interpret as "consider all rows for this repo as active".
+        """
+        from sqlalchemy import select as sa_select
+
+        latest_completed_id = (
+            sa_select(RepoDiskUsageScan.id)
+            .where(
+                RepoDiskUsageScan.repoid == repoid,
+                RepoDiskUsageScan.status == RepoDiskUsageScan.STATUS_COMPLETED,
+            )
+            .order_by(RepoDiskUsageScan.id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        return latest_completed_id
+
+    @classmethod
+    def active_query(cls, repoid):
+        """
+        Return a query object pre-filtered to only include "active" DiskUsage
+        rows for ``repoid``.
+
+        Active-row selection logic:
+        1. If a completed scan exists for the repo: only rows whose
+           ``scan_id`` matches the latest completed scan are active.
+        2. If NO completed scan exists: every row for the repo is active
+           (covers legacy data without scan_id, and migration failures).
+        3. Rows from pending / failed scans are never visible.
+
+        This method does NOT rely on cascade-delete to remove old data.
+        """
+        from sqlalchemy import and_, or_, select as sa_select
+
+        latest_completed_id = (
+            sa_select(RepoDiskUsageScan.id)
+            .where(
+                RepoDiskUsageScan.repoid == repoid,
+                RepoDiskUsageScan.status == RepoDiskUsageScan.STATUS_COMPLETED,
+            )
+            .order_by(RepoDiskUsageScan.id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+
+        has_any_completed = (
+            sa_select(func.count())
+            .where(
+                RepoDiskUsageScan.repoid == repoid,
+                RepoDiskUsageScan.status == RepoDiskUsageScan.STATUS_COMPLETED,
+            )
+            .scalar_subquery()
+        )
+
+        return cls.query.filter(
+            cls.repoid == repoid,
+            or_(
+                # Case A: there are completed scans; only rows of latest completed are active
+                and_(
+                    has_any_completed > 0,
+                    cls.scan_id == latest_completed_id,
+                ),
+                # Case B: no completed scans yet; show all rows including legacy (scan_id IS NULL)
+                has_any_completed == 0,
+            ),
+        )
+
+    @classmethod
     def replace_for_scan(cls, scan_id, repoid, entries):
         """
         Insert DiskUsage rows for a completed scan.
 
         ``entries`` is an iterable of ``(logical_path, mirror_size, increments_size)`` tuples.
-
-        After insertion, callers should call :meth:`remove_old_scans_for_repo`
-        to prune rows from previous scans.
         """
         for logical_path, mirror_size, increments_size in entries:
             cls(
@@ -163,18 +236,29 @@ class DiskUsage(Base):
     @classmethod
     def remove_old_scans_for_repo(cls, repoid, keep_scan_id):
         """
-        Delete all DiskUsage rows and RepoDiskUsageScan records for ``repoid``
-        except those belonging to ``keep_scan_id``.
+        Explicitly delete old DiskUsage rows and RepoDiskUsageScan records
+        for ``repoid``, keeping only those belonging to ``keep_scan_id``.
 
-        Also cleans up any orphaned pending scans older than the completed one.
+        Deletes DiskUsage rows first (independent of FK cascade) then the
+        scan records, so this works correctly even when cascade is not
+        enforced by the database.
         """
         from sqlalchemy import delete
 
-        delete_stmt = delete(RepoDiskUsageScan).where(
-            RepoDiskUsageScan.repoid == repoid,
-            RepoDiskUsageScan.id != keep_scan_id,
+        cherrypy.db.session.execute(
+            delete(DiskUsage).where(
+                DiskUsage.repoid == repoid,
+                DiskUsage.scan_id != keep_scan_id,
+                DiskUsage.scan_id.isnot(None),
+            )
         )
-        cherrypy.db.session.execute(delete_stmt)
+
+        cherrypy.db.session.execute(
+            delete(RepoDiskUsageScan).where(
+                RepoDiskUsageScan.repoid == repoid,
+                RepoDiskUsageScan.id != keep_scan_id,
+            )
+        )
 
     def __repr__(self):
         return f"DiskUsage({self.repoid!r}, {self.logical_path!r}, mirror_size={self.mirror_size!r}, increments_size={self.increments_size!r})"

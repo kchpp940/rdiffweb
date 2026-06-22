@@ -436,22 +436,18 @@ class RepoObject(MessageMixin, Base, RdiffRepo):
         """
         Override this implementation to include disk usage data.
         """
-        # Get on disk values
         entries = super().listdir(path)
         if not entries:
             return []
 
-        # Query disk usage for the given path
         from ._diskusage import DiskUsage
 
-        # Normalize path for database lookup.
         path = os.path.normpath(path).strip(b'/')
         if path == b'.':
             path = b''
         du_by_path = {
             du.logical_path: du
-            for du in DiskUsage.query.filter(
-                DiskUsage.repoid == self.id,
+            for du in DiskUsage.active_query(self.id).filter(
                 DiskUsage.parent_path == path,
             ).all()
         }
