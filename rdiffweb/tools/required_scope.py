@@ -15,6 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import cherrypy
 
+from rdiffweb.tools.api_auth import AuthResult
+
 
 # Canonical list of all supported scopes and their display names.
 # Used for validation, UI display, and OpenAPI generation.
@@ -34,6 +36,10 @@ def required_scope(scope):
     """
     Check the current authentication has the required scope to access the resource.
 
+    Reads scope from the unified AuthResult (request.api_auth) rather than
+    directly from request.scope, ensuring the value was set by the single
+    resolve_api_auth() entry point.
+
     Each endpoint must explicitly declare which scopes are allowed. There is NO
     implicit scope inheritance (e.g. write_user does NOT grant read_user).
     The 'all' scope is the only exception: it grants access to every endpoint
@@ -46,8 +52,15 @@ def required_scope(scope):
     # Convert single scope or scope list to array.
     if isinstance(scope, str):
         scope = scope.split(',')
-    # Get the current user scope
-    current_scope = getattr(cherrypy.serving.request, 'scope', [])
+
+    # Read scope from the unified AuthResult.
+    auth = AuthResult.from_request()
+
+    # If authentication failed entirely, raise 403.
+    if not auth.is_valid:
+        raise cherrypy.HTTPError(403)
+
+    current_scope = auth.scope
     if not current_scope:
         raise cherrypy.HTTPError(403)
 
@@ -62,5 +75,5 @@ def required_scope(scope):
     raise cherrypy.HTTPError(403)
 
 
-# Make sure it's running after authentication (priority = 72)
+# Make sure it's running after authentication (priority = 85)
 cherrypy.tools.required_scope = cherrypy.Tool('before_handler', required_scope, priority=85)

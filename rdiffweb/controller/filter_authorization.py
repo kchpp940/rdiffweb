@@ -15,19 +15,21 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import cherrypy
 
+from rdiffweb.tools.api_auth import AuthResult
+
 
 def is_admin():
-    # Validate the permissions.
-    if not cherrypy.serving.request.currentuser or not cherrypy.serving.request.currentuser.is_admin:
+    auth = AuthResult.from_request()
+    if not auth.is_valid or not auth.user or not auth.user.is_admin:
         raise cherrypy.HTTPError(403)
 
 
 def is_maintainer():
-    # Validate the permissions.
-    if not cherrypy.serving.request.currentuser or not cherrypy.serving.request.currentuser.is_maintainer:
+    auth = AuthResult.from_request()
+    if not auth.is_valid or not auth.user or not auth.user.is_maintainer:
         raise cherrypy.HTTPError(403)
 
 
-# Make sure it's running after authentication (priority = 72)
+# Make sure it's running after authentication (priority = 80)
 cherrypy.tools.is_admin = cherrypy.Tool('before_handler', is_admin, priority=80)
 cherrypy.tools.is_maintainer = cherrypy.Tool('before_handler', is_maintainer, priority=80)
